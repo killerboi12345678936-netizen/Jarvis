@@ -29,7 +29,7 @@ PIPER_MODEL = os.getenv(
 
 
 # --------------------------------------------------
-# SYNCHRONOUS PIPER EXECUTION
+# PIPER EXECUTION
 # --------------------------------------------------
 
 def _generate_audio(text: str) -> Path:
@@ -88,7 +88,6 @@ def _generate_audio(text: str) -> Path:
         ) from exc
 
     if result.returncode != 0:
-
         output_path.unlink(missing_ok=True)
 
         stderr = result.stderr.decode(
@@ -125,7 +124,7 @@ def _generate_audio(text: str) -> Path:
 
 
 # --------------------------------------------------
-# ASYNC PUBLIC FUNCTION
+# ASYNC PUBLIC FUNCTIONS
 # --------------------------------------------------
 
 async def synthesize_speech(text: str) -> Path:
@@ -138,7 +137,26 @@ async def synthesize_speech(text: str) -> Path:
             "Text exceeds the 5000 character limit."
         )
 
-    # Run blocking Piper execution outside the event loop.
+    return await asyncio.to_thread(
+        _generate_audio,
+        text
+    )
+
+
+async def synthesize_sentence(text: str) -> Path:
+    """
+    Generate one sentence as a separate WAV file.
+    Intended for progressive speech playback.
+    """
+
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("Sentence cannot be empty.")
+
+    if len(text) > 1000:
+        raise ValueError(
+            "Sentence exceeds the 1000 character limit."
+        )
+
     return await asyncio.to_thread(
         _generate_audio,
         text

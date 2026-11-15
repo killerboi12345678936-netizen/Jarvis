@@ -1,4 +1,3 @@
-
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
@@ -43,12 +42,6 @@ type ProvidersResponse = {
   providers: Record<string, ProviderInfo>;
 };
 
-type ChatResponse = {
-  session_id: number;
-  provider: string;
-  model: string;
-  response: string;
-};
 
 function App() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -72,6 +65,7 @@ function App() {
   const audioChunksRef = useRef<Blob[]>([]);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
+  const speechRunRef = useRef(0);
 
 
   const scrollToBottom = () => {
@@ -83,6 +77,7 @@ function App() {
   }, [messages, loading]);
 
   const stopAudio = useCallback(() => {
+    speechRunRef.current += 1;
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current = null;
@@ -220,22 +215,140 @@ function App() {
     }
   };
 
+
   const sendMessage = async (messageOverride?: string) => {
     const message = (messageOverride ?? input).trim();
 
     if (!message || loading || !connected) return;
 
     setInput("");
+
     setMessages((previous) => [
       ...previous,
       { role: "user", content: message },
+      { role: "assistant", content: "" },
     ]);
 
     setLoading(true);
     setStatus("Jarvis is thinking...");
 
+    // Stop any previous speech and create a new speech run for this response.
+    stopAudio();
+    const speechRun = ++speechRunRef.current;
+    const shouldSpeak = voiceEnabled;
+
+    let fullResponse = "";
+    let speechBuffer = "";
+    let playbackChain: Promise<void> = Promise.resolve();
+
+    const playAudioBlob = async (blob: Blob) => {
+      if (speechRunRef.current !== speechRun) return;
+
+      const url = URL.createObjectURL(blob);
+      audioUrlRef.current = url;
+
+      const audio = new Audio(url);
+      audioRef.current = audio;
+
+      setSpeaking(true);
+      setStatus("Jarvis is speaking...");
+
+      await new Promise<void>((resolve) => {
+        let finished = false;
+
+        const finish = () => {
+          if (finished) return;
+          finished = true;
+
+          audio.onended = null;
+          audio.onerror = null;
+          audio.onpause = null;
+
+          if (audioRef.current === audio) {
+            audioRef.current = null;
+          }
+
+          URL.revokeObjectURL(url);
+
+          if (audioUrlRef.current === url) {
+            audioUrlRef.current = null;
+          }
+
+          resolve();
+        };
+
+        audio.onended = finish;
+        audio.onerror = finish;
+        audio.onpause = finish;
+
+        void audio.play().catch(finish);
+      });
+
+      if (speechRunRef.current === speechRun) {
+        setSpeaking(false);
+      }
+    };
+
+    const enqueueSentence = (sentence: string) => {
+      const cleanSentence = sentence.trim();
+
+      if (
+        !cleanSentence ||
+        !shouldSpeak ||
+        speechRunRef.current !== speechRun
+      ) {
+        return;
+      }
+
+      // Generate audio as soon as a complete sentence is available.
+      const audioPromise = fetch(`${API}/api/voice/speak/sentence`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ text: cleanSentence }),
+      }).then(async (response) => {
+        if (!response.ok) {
+          throw new Error("Sentence voice generation failed.");
+        }
+
+        return response.blob();
+      });
+
+      // Keep playback in sentence order while audio generation overlaps.
+      playbackChain = playbackChain.then(async () => {
+        try {
+          const blob = await audioPromise;
+
+          if (speechRunRef.current !== speechRun) return;
+
+          await playAudioBlob(blob);
+        } catch (error) {
+          if (speechRunRef.current === speechRun) {
+            console.error("Sentence audio error:", error);
+          }
+        }
+      });
+    };
+
+    const extractCompleteSentences = () => {
+      const sentenceRegex = /[^.!?]+[.!?]+(?:["')\]]*)\s+/g;
+
+      let match: RegExpExecArray | null;
+      let consumedLength = 0;
+
+      while ((match = sentenceRegex.exec(speechBuffer)) !== null) {
+        enqueueSentence(match[0]);
+        consumedLength = sentenceRegex.lastIndex;
+      }
+
+      if (consumedLength > 0) {
+        speechBuffer = speechBuffer.slice(consumedLength);
+      }
+    };
+
     try {
-      const response = await fetch(`${API}/api/chat/`, {
+      const response = await fetch(`${API}/api/chat/stream`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -248,40 +361,159 @@ function App() {
         }),
       });
 
-      const data: ChatResponse | { detail?: string } =
-        await response.json();
-
       if (!response.ok) {
-        throw new Error(
-          "detail" in data ? data.detail || "Chat request failed." : "Chat request failed."
-        );
+        let errorMessage = "Chat request failed.";
+
+        try {
+          const data = await response.json();
+          errorMessage = data.detail || errorMessage;
+        } catch {
+          // Keep the default error message.
+        }
+
+        throw new Error(errorMessage);
       }
 
-      const result = data as ChatResponse;
+      if (!response.body) {
+        throw new Error("Streaming response unavailable.");
+      }
 
-      setSessionId(result.session_id);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
 
-      setMessages((previous) => [
-        ...previous,
-        { role: "assistant", content: result.response },
-      ]);
+      let buffer = "";
+      let completed = false;
 
-      setStatus(`Online · ${result.provider} · ${result.model}`);
+      const processEvent = (block: string) => {
+        const dataLines = block
+          .split(/\r?\n/)
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trim());
 
-      if (voiceEnabled) {
-        void speak(result.response);
+        if (dataLines.length === 0) return;
+
+        const event = JSON.parse(dataLines.join("\n"));
+
+        if (event.type === "start") {
+          setSessionId(event.session_id);
+          setStatus("Jarvis is responding...");
+        }
+
+        if (event.type === "chunk") {
+          fullResponse += event.text;
+
+          setMessages((previous) => {
+            const updated = [...previous];
+            const lastIndex = updated.length - 1;
+
+            if (updated[lastIndex]?.role === "assistant") {
+              updated[lastIndex] = {
+                ...updated[lastIndex],
+                content: fullResponse,
+              };
+            }
+
+            return updated;
+          });
+
+          if (shouldSpeak) {
+            speechBuffer += event.text;
+            extractCompleteSentences();
+          }
+        }
+
+        if (event.type === "done") {
+          completed = true;
+
+          if (event.response) {
+            fullResponse = event.response;
+
+            setMessages((previous) => {
+              const updated = [...previous];
+              const lastIndex = updated.length - 1;
+
+              if (updated[lastIndex]?.role === "assistant") {
+                updated[lastIndex] = {
+                  ...updated[lastIndex],
+                  content: fullResponse,
+                };
+              }
+
+              return updated;
+            });
+          }
+
+          setStatus(`Online · ${event.provider} · ${event.model}`);
+        }
+
+        if (event.type === "error") {
+          throw new Error(event.message || "Streaming failed.");
+        }
+      };
+
+      while (true) {
+        const { value, done } = await reader.read();
+
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        const blocks = buffer.split(/\r?\n\r?\n/);
+        buffer = blocks.pop() ?? "";
+
+        for (const block of blocks) {
+          processEvent(block);
+        }
+      }
+
+      buffer += decoder.decode();
+
+      if (buffer.trim()) {
+        processEvent(buffer);
+      }
+
+      if (!completed) {
+        throw new Error("The streaming connection ended unexpectedly.");
+      }
+
+      // Flush the final text, even if it doesn't end with punctuation.
+      if (speechBuffer.trim()) {
+        enqueueSentence(speechBuffer);
+        speechBuffer = "";
+      }
+
+      // Update the status when the final queued sentence finishes playing.
+      if (shouldSpeak) {
+        void playbackChain.then(() => {
+          if (speechRunRef.current === speechRun) {
+            setSpeaking(false);
+            setStatus("Jarvis online");
+          }
+        });
       }
     } catch (error) {
       const errorMessage =
-        error instanceof Error ? error.message : "Something went wrong.";
+        error instanceof Error
+          ? error.message
+          : "Something went wrong.";
 
-      setMessages((previous) => [
-        ...previous,
-        {
-          role: "assistant",
-          content: `I encountered an error: ${errorMessage}`,
-        },
-      ]);
+      setMessages((previous) => {
+        const updated = [...previous];
+        const lastIndex = updated.length - 1;
+
+        if (updated[lastIndex]?.role === "assistant") {
+          const existing = updated[lastIndex].content;
+
+          updated[lastIndex] = {
+            ...updated[lastIndex],
+            content: existing
+              ? `${existing}\n\nI encountered an error: ${errorMessage}`
+              : `I encountered an error: ${errorMessage}`,
+          };
+        }
+
+        return updated;
+      });
 
       setStatus("Request failed");
     } finally {
@@ -709,10 +941,10 @@ function App() {
           </div>
 
           <div className="composer-caption">
-            <span>JARVIS AI · V1.0</span>
+            <span>JARVIS AI Â· V1.0</span>
             <span>
               {recording
-                ? "Recording · press stop when finished"
+                ? "Recording Â· press stop when finished"
                 : "Text and voice interface"}
             </span>
           </div>

@@ -10,7 +10,10 @@ from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from backend.voice.speech_to_text import transcribe_audio
-from backend.voice.text_to_speech import synthesize_speech
+from backend.voice.text_to_speech import (
+    synthesize_speech,
+    synthesize_sentence,
+)
 
 
 # --------------------------------------------------
@@ -38,6 +41,10 @@ ALLOWED_AUDIO_EXTENSIONS = {
 
 class SpeechRequest(BaseModel):
     text: str = Field(min_length=1, max_length=5000)
+
+
+class SentenceSpeechRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=1000)
 
 
 # --------------------------------------------------
@@ -94,6 +101,34 @@ async def transcribe(file: UploadFile = File(...)):
 
 
 # --------------------------------------------------
+# AUDIO RESPONSE HELPER
+# --------------------------------------------------
+
+def audio_file_response(audio_path: Path):
+    audio_path = Path(audio_path)
+
+    if not audio_path.is_file():
+        raise RuntimeError(
+            "TTS completed but the audio file does not exist."
+        )
+
+    if audio_path.stat().st_size == 0:
+        raise RuntimeError(
+            "TTS generated an empty audio file."
+        )
+
+    return FileResponse(
+        path=str(audio_path),
+        media_type="audio/wav",
+        filename="jarvis_speech.wav",
+        background=BackgroundTask(
+            audio_path.unlink,
+            missing_ok=True,
+        ),
+    )
+
+
+# --------------------------------------------------
 # TEXT TO SPEECH
 # --------------------------------------------------
 
@@ -105,27 +140,7 @@ async def speak(request: SpeechRequest):
     try:
         audio_path = await synthesize_speech(request.text)
 
-        audio_path = Path(audio_path)
-
-        if not audio_path.is_file():
-            raise RuntimeError(
-                "TTS completed but the audio file does not exist."
-            )
-
-        if audio_path.stat().st_size == 0:
-            raise RuntimeError(
-                "TTS generated an empty audio file."
-            )
-
-        return FileResponse(
-            path=str(audio_path),
-            media_type="audio/wav",
-            filename="jarvis_speech.wav",
-            background=BackgroundTask(
-                audio_path.unlink,
-                missing_ok=True,
-            ),
-        )
+        return audio_file_response(audio_path)
 
     except Exception as exc:
         logger.exception("JARVIS TTS ERROR")
@@ -136,13 +151,44 @@ async def speak(request: SpeechRequest):
             except OSError:
                 logger.exception("Could not clean up failed TTS file")
 
-        error_message = str(exc).strip()
+        error_message = str(exc).strip() or (
+            f"{type(exc).__name__}: An error occurred."
+        )
 
-        if not error_message:
-            error_message = (
-                f"{type(exc).__name__}: "
-                "An error occurred without an error message."
-            )
+        raise HTTPException(
+            status_code=503,
+            detail=error_message,
+        ) from exc
+
+
+# --------------------------------------------------
+# SENTENCE-LEVEL TEXT TO SPEECH
+# --------------------------------------------------
+
+@router.post("/speak/sentence")
+async def speak_sentence(request: SentenceSpeechRequest):
+
+    audio_path = None
+
+    try:
+        audio_path = await synthesize_sentence(request.text)
+
+        return audio_file_response(audio_path)
+
+    except Exception as exc:
+        logger.exception("JARVIS SENTENCE TTS ERROR")
+
+        if audio_path is not None:
+            try:
+                Path(audio_path).unlink(missing_ok=True)
+            except OSError:
+                logger.exception(
+                    "Could not clean up failed sentence audio"
+                )
+
+        error_message = str(exc).strip() or (
+            f"{type(exc).__name__}: An error occurred."
+        )
 
         raise HTTPException(
             status_code=503,
