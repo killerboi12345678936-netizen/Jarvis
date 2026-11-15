@@ -1,0 +1,117 @@
+
+from typing import Literal
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+
+from backend.core.config import settings
+from backend.memory.database import (
+    create_session,
+    get_session,
+    get_messages,
+    save_message,
+)
+from backend.providers.manager import (
+    provider_manager,
+    ProviderError,
+)
+
+router = APIRouter(prefix="/api/chat", tags=["Chat"])
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=20000)
+    session_id: int | None = None
+    provider: Literal["ollama", "gemini", "nvidia"] | None = None
+    model: str | None = Field(default=None, max_length=200)
+
+
+class ChatResponse(BaseModel):
+    session_id: int
+    provider: str
+    model: str
+    response: str
+
+
+@router.post("/", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+
+    provider = (
+        request.provider or provider_manager.default_provider
+    ).lower()
+
+    try:
+        model = request.model or provider_manager.get_model(provider)
+
+        if request.session_id is None:
+            session_id = await create_session()
+        else:
+            session = await get_session(request.session_id)
+
+            if not session:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Conversation session not found.",
+                )
+
+            if session["closed_at"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail="This conversation is closed. Start a new session.",
+                )
+
+            session_id = request.session_id
+
+        await save_message(
+            session_id,
+            "user",
+            provider,
+            request.message,
+        )
+
+        history = await get_messages(
+            session_id,
+            limit=settings.history_limit,
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": settings.system_prompt,
+            }
+        ]
+
+        messages.extend([
+            {
+                "role": item["role"],
+                "content": item["content"],
+            }
+            for item in history
+            if item["role"] in ("user", "assistant")
+        ])
+
+        answer = await provider_manager.ask(
+            messages=messages,
+            provider=provider,
+            model=model,
+        )
+
+        await save_message(
+            session_id,
+            "assistant",
+            provider,
+            answer,
+        )
+
+        return ChatResponse(
+            session_id=session_id,
+            provider=provider,
+            model=model,
+            response=answer,
+        )
+
+    except ProviderError as error:
+        raise HTTPException(
+            status_code=502,
+            detail=str(error),
+        ) from error

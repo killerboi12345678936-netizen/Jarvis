@@ -1,8 +1,10 @@
-
+from backend.api.routes import sessions, memories
 from contextlib import asynccontextmanager
-
+from backend.api.routes import chat, providers
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from backend.api.routes import actions
+from backend.api.routes import voice
 
 from backend.memory.database import init_db
 
@@ -29,6 +31,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(chat.router)
+app.include_router(providers.router)
+app.include_router(sessions.router)
+app.include_router(memories.router)
+app.include_router(actions.router)
+app.include_router(voice.router)
 
 
 @app.get("/")

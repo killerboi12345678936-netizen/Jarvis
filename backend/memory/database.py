@@ -1,4 +1,5 @@
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -9,6 +10,10 @@ DATA_DIR = PROJECT_ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
 DB_PATH = DATA_DIR / "jarvis.db"
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
 
 
 async def init_db():
@@ -47,6 +52,189 @@ async def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_memories_category
         ON memories(category);
+
+        CREATE TABLE IF NOT EXISTS tool_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tool_name TEXT NOT NULL,
+            arguments TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            result TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tool_actions_status
+        ON tool_actions(status);
+
         """)
 
         await db.commit()
+
+
+async def create_session():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT INTO sessions (created_at) VALUES (?)",
+            (now(),),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_session(session_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute(
+            "SELECT * FROM sessions WHERE id = ?",
+            (session_id,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def list_sessions(limit=50):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute(
+            """
+            SELECT s.*,
+                   (SELECT content FROM messages
+                    WHERE session_id = s.id
+                    ORDER BY id DESC LIMIT 1) AS last_message
+            FROM sessions s
+            ORDER BY s.id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def close_session(session_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            UPDATE sessions
+            SET closed_at = ?
+            WHERE id = ? AND closed_at IS NULL
+            """,
+            (now(), session_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def save_message(session_id, role, provider, content):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO messages
+            (session_id, role, provider, content, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (session_id, role, provider, content, now()),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_messages(session_id, limit=100):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute(
+            """
+            SELECT * FROM (
+                SELECT * FROM messages
+                WHERE session_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+            )
+            ORDER BY id ASC
+            """,
+            (session_id, limit),
+        )
+
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def add_memory(content, category="general"):
+    timestamp = now()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO memories
+            (content, category, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (content, category, timestamp, timestamp),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_memories(category=None, search=None, limit=100):
+    query = "SELECT * FROM memories WHERE 1=1"
+    params = []
+
+    if category:
+        query += " AND category = ?"
+        params.append(category)
+
+    if search:
+        query += " AND content LIKE ?"
+        params.append(f"%{search}%")
+
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute(query, params)
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def update_memory(memory_id, content=None, category=None):
+    updates = []
+    params = []
+
+    if content is not None:
+        updates.append("content = ?")
+        params.append(content)
+
+    if category is not None:
+        updates.append("category = ?")
+        params.append(category)
+
+    if not updates:
+        return False
+
+    updates.append("updated_at = ?")
+    params.append(now())
+    params.append(memory_id)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            f"UPDATE memories SET {', '.join(updates)} WHERE id = ?",
+            params,
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def delete_memory(memory_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM memories WHERE id = ?",
+            (memory_id,),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
