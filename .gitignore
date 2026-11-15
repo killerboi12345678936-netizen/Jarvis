@@ -3,3 +3,13 @@
 __pycache__/
 *.py[cod]
 jarvis.db
+
+# Frontend dependencies and build output
+node_modules/
+dist/
+build/
+
+# Generated voice test files
+data/voice/*speed_test.wav
+data/voice/repeat_test.wav
+data/voice/api_speed_test.wav
