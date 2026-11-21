@@ -1,10 +1,8 @@
 
 import json
 
-from starlette.concurrency import run_in_threadpool
-
 from backend.tools.permissions import propose_action
-from backend.tools.registry import execute_tool, get_tool
+from backend.tools.registry import get_tool, run_tool
 
 
 async def process_tool_calls(tool_calls):
@@ -30,11 +28,7 @@ async def process_tool_calls(tool_calls):
 
         if tool["permission"] == "automatic":
             try:
-                result = await run_in_threadpool(
-                    execute_tool,
-                    name,
-                    arguments,
-                )
+                result = await run_tool(name, arguments)
 
                 tool_results.append({
                     "tool": name,

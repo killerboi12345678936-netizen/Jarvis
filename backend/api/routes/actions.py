@@ -7,9 +7,9 @@ from pydantic import BaseModel, Field
 
 from backend.tools.registry import (
     TOOLS,
-    execute_tool,
     get_tool,
 )
+from backend.tools.service import run_tool
 from backend.tools.permissions import (
     propose_action,
     get_action,
@@ -47,7 +47,7 @@ async def propose(request: ActionRequest):
 
     if tool["permission"] == "automatic":
         try:
-            result = execute_tool(
+            result = await run_tool(
                 request.tool_name,
                 request.arguments,
             )
@@ -102,7 +102,7 @@ async def approve(action_id: int):
     try:
         arguments = json.loads(action["arguments"])
 
-        result = execute_tool(
+        result = await run_tool(
             action["tool_name"],
             arguments,
         )

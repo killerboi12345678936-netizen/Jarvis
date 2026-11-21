@@ -1,11 +1,19 @@
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+import inspect
 import platform
 import re
 import subprocess
 
 from backend.core.config import settings
+from backend.integrations.calendar import service as calendar_service
+from backend.memory.database import (
+    create_calendar_event,
+    delete_calendar_event,
+    get_event_by_id,
+)
+from starlette.concurrency import run_in_threadpool
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -126,6 +134,97 @@ def open_application(arguments):
     }
 
 
+def _parse_datetime_argument(value):
+    text = str(value).strip()
+
+    if not text:
+        raise ValueError("Missing datetime value.")
+
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as error:
+        raise ValueError(
+            "Use an ISO datetime like 2026-11-25T14:00 or "
+            "2026-11-25T14:00+02:00."
+        ) from error
+
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+async def read_calendar(arguments):
+    try:
+        days = int(arguments.get("days", 14))
+    except (TypeError, ValueError):
+        days = 14
+
+    days = max(1, min(days, 60))
+
+    events = await calendar_service.get_upcoming(days=days)
+
+    return {"days": days, "events": events}
+
+
+async def create_event(arguments):
+    title = str(arguments.get("title", "")).strip()
+    notes = arguments.get("notes")
+
+    start_utc = _parse_datetime_argument(arguments.get("start", ""))
+    end_utc = _parse_datetime_argument(arguments.get("end", ""))
+
+    if not title:
+        raise ValueError("Event title cannot be empty.")
+
+    if len(title) > 200:
+        raise ValueError("Event title is too long.")
+
+    if start_utc >= end_utc:
+        raise ValueError("Event start must be before its end.")
+
+    event_id = await create_calendar_event(
+        title,
+        start_utc,
+        end_utc,
+        str(notes) if notes else None,
+    )
+
+    return {
+        "created": True,
+        "event_id": event_id,
+        "title": title,
+        "start_utc": start_utc,
+        "end_utc": end_utc,
+    }
+
+
+async def delete_event(arguments):
+    try:
+        event_id = int(arguments.get("event_id"))
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "delete_event needs the numeric event_id shown by "
+            "read_calendar."
+        ) from error
+
+    existing = await get_event_by_id(event_id)
+
+    if not existing:
+        raise ValueError(
+            f"No local event with id {event_id}. Only events created "
+            "locally can be deleted."
+        )
+
+    await delete_calendar_event(event_id)
+
+    return {
+        "deleted": True,
+        "event_id": event_id,
+        "title": existing["title"],
+    }
+
+
 TOOLS = {
     "get_time": {
         "description": "Get the computer's current local time.",
@@ -180,6 +279,43 @@ TOOLS = {
             "name": "application name from the allowed list",
         },
     },
+    "read_calendar": {
+        "description": (
+            "Read Jarvis's upcoming calendar events (merged from the "
+            "configured ICS calendar and locally created events) with "
+            "busy and free time information."
+        ),
+        "permission": "automatic",
+        "function": read_calendar,
+        "arguments": {
+            "days": "how many days ahead to look, 1-60 (default 14)",
+        },
+    },
+    "create_event": {
+        "description": (
+            "Create a local calendar event. Only call this when the "
+            "user explicitly asks to schedule something."
+        ),
+        "permission": "approval_required",
+        "function": create_event,
+        "arguments": {
+            "title": "short event title",
+            "start": "start datetime, e.g. 2026-11-25T14:00",
+            "end": "end datetime, e.g. 2026-11-25T15:00",
+            "notes": "optional notes",
+        },
+    },
+    "delete_event": {
+        "description": (
+            "Delete a locally created calendar event by its event_id "
+            "from read_calendar. Imported ICS events cannot be deleted."
+        ),
+        "permission": "approval_required",
+        "function": delete_event,
+        "arguments": {
+            "event_id": "numeric id from read_calendar",
+        },
+    },
 }
 
 
@@ -193,4 +329,23 @@ def execute_tool(name, arguments):
     if not tool:
         raise ValueError(f"Tool '{name}' is not registered.")
 
-    return tool["function"](arguments)
+    result = tool["function"](arguments)
+
+    if inspect.iscoroutine(result):
+        return result
+
+    return result
+
+
+async def run_tool(name, arguments):
+    tool = get_tool(name)
+
+    if not tool:
+        raise ValueError(f"Tool '{name}' is not registered.")
+
+    function = tool["function"]
+
+    if inspect.iscoroutinefunction(function):
+        return await function(arguments)
+
+    return await run_in_threadpool(function, arguments)

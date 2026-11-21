@@ -68,6 +68,20 @@ async def init_db():
         CREATE INDEX IF NOT EXISTS idx_tool_actions_status
         ON tool_actions(status);
 
+        CREATE TABLE IF NOT EXISTS calendar_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            start_utc TEXT NOT NULL,
+            end_utc TEXT NOT NULL,
+            notes TEXT,
+            source TEXT NOT NULL DEFAULT 'local',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_calendar_events_start
+        ON calendar_events(start_utc);
+
         """)
 
         await db.commit()
@@ -262,3 +276,101 @@ async def delete_memory(memory_id):
         )
         await db.commit()
         return cursor.rowcount > 0
+
+
+async def create_calendar_event(title, start_utc, end_utc, notes=None):
+    timestamp = now()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO calendar_events
+            (title, start_utc, end_utc, notes, source, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'local', ?, ?)
+            """,
+            (title, start_utc, end_utc, notes, timestamp, timestamp),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def list_calendar_events(start_after=None, start_before=None, limit=200):
+    query = "SELECT * FROM calendar_events WHERE 1=1"
+    params = []
+
+    if start_after:
+        query += " AND end_utc >= ?"
+        params.append(start_after)
+
+    if start_before:
+        query += " AND start_utc <= ?"
+        params.append(start_before)
+
+    query += " ORDER BY start_utc ASC LIMIT ?"
+    params.append(limit)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute(query, params)
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def update_calendar_event(
+    event_id,
+    title=None,
+    start_utc=None,
+    end_utc=None,
+    notes=None,
+):
+    updates = []
+    params = []
+
+    for column, value in (
+        ("title", title),
+        ("start_utc", start_utc),
+        ("end_utc", end_utc),
+        ("notes", notes),
+    ):
+        if value is not None:
+            updates.append(f"{column} = ?")
+            params.append(value)
+
+    if not updates:
+        return False
+
+    updates.append("updated_at = ?")
+    params.append(now())
+    params.append(event_id)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            f"UPDATE calendar_events SET {', '.join(updates)} WHERE id = ?",
+            params,
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def delete_calendar_event(event_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM calendar_events WHERE id = ?",
+            (event_id,),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def get_event_by_id(event_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute(
+            "SELECT * FROM calendar_events WHERE id = ?",
+            (event_id,),
+        )
+
+        row = await cursor.fetchone()
+        return dict(row) if row else None

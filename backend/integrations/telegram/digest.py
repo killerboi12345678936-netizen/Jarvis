@@ -24,26 +24,6 @@ Rules:
 - If there are no assignments or deadlines, use empty lists."""
 
 
-PLAN_INSTRUCTIONS = """You are Jarvis, a study planner. Given the student's
-deadlines, assignments and available time, produce a realistic study plan.
-
-Return ONLY a JSON object (no markdown fences):
-{
-  "plan_title": "...",
-  "days": [
-    {"date": "...", "blocks": [
-      {"subject": "Mathematics", "task": "...", "duration_minutes": 60}
-    ]}
-  ],
-  "notes": "brief advice"
-}
-
-Rules:
-- Sessions of 45-90 minutes with realistic breaks.
-- Prioritize nearest deadlines.
-- Never invent deadlines that were not provided."""
-
-
 def _extract_json(text):
     text = text.strip()
 
@@ -149,18 +129,3 @@ async def build_digest(hours=24):
         }
 
     return digest
-
-
-async def build_study_plan(kind, days=7, deadlines_text=""):
-    horizon = "daily (today only)" if kind == "daily" else f"weekly ({days} days)"
-
-    content = (
-        f"Plan horizon: {horizon}.\n"
-        f"Today: the user will tell you the date context if needed.\n\n"
-        f"Deadlines and assignments:\n{deadlines_text or 'None provided.'}\n\n"
-        "Create the study plan."
-    )
-
-    data, raw = await _ask_json(PLAN_INSTRUCTIONS, content)
-
-    return {"kind": kind, "plan": data, "raw_plan": raw}
