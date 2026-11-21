@@ -9,6 +9,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env")
 
 
+def parse_allowed_apps(raw):
+    return {
+        pair.split("=", 1)[0].strip().lower(): pair.split("=", 1)[1].strip()
+        for pair in raw.split(",")
+        if "=" in pair
+    }
+
+
 class Settings:
     app_name = "Jarvis"
     app_version = "1.0.0"
@@ -80,14 +88,12 @@ class Settings:
     calendar_ics_file = os.getenv("CALENDAR_ICS_FILE", "")
 
     # ---- Desktop ----
-    desktop_allowed_apps = {
-        pair.split("=", 1)[0].strip().lower(): pair.split("=", 1)[1].strip()
-        for pair in os.getenv(
+    desktop_allowed_apps = parse_allowed_apps(
+        os.getenv(
             "DESKTOP_ALLOWED_APPS",
             "notepad=notepad,calculator=calc,paint=mspaint",
-        ).split(",")
-        if "=" in pair
-    }
+        )
+    )
 
 
 settings = Settings()
