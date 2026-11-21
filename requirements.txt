@@ -1,3 +1,6 @@
+# Integrations
+telethon>=1.36.0
+
 # Original CLI (root main.py)
 requests>=2.32.0
 

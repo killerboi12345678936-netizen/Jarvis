@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 from backend.api.routes import actions
 from backend.api.routes import voice
+from backend.api.routes import integrations
 from backend.voice.stream import router as voice_stream_router
 
 from backend.core.config import settings
@@ -49,6 +50,7 @@ app.include_router(memories.router)
 app.include_router(actions.router)
 app.include_router(voice.router)
 app.include_router(voice_stream_router)
+app.include_router(integrations.router)
 
 
 @app.get("/")
