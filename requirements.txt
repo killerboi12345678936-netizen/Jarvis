@@ -1,2 +1,16 @@
+# Original CLI (root main.py)
 requests>=2.32.0
+
+# Shared configuration
 python-dotenv>=1.0.1
+
+# Backend API (uvicorn backend.main:app)
+fastapi>=0.115.0
+uvicorn>=0.30.0
+httpx>=0.27.0
+python-multipart>=0.0.9
+aiosqlite>=0.20.0
+
+# Voice
+faster-whisper>=1.0.0
+piper-tts>=1.0.0

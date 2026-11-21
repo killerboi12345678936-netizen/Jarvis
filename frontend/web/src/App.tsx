@@ -42,6 +42,69 @@ type ProvidersResponse = {
   providers: Record<string, ProviderInfo>;
 };
 
+type StreamEvent = {
+  type: "start" | "chunk" | "done" | "error";
+  session_id?: number;
+  provider?: string;
+  model?: string;
+  text?: string;
+  response?: string;
+  message?: string;
+};
+
+// Words after which a period does not end a sentence, plus single-letter
+// initials such as "J." or the "e." in "e.g.".
+const SENTENCE_ABBREVIATIONS = new Set([
+  "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc",
+  "eg", "ie", "fig", "approx", "dept", "est", "inc", "ltd", "co",
+  "corp", "rev", "hon", "capt", "sgt", "gen", "col", "lt", "mt",
+  "ft", "apt", "no", "al", "cf", "viz", "ph", "md", "min", "max",
+  "sec", "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep",
+  "sept", "oct", "nov", "dec",
+]);
+
+// Quotes, brackets, and markdown emphasis that may trail sentence punctuation.
+const SENTENCE_CLOSERS = new Set([
+  "\"", "'", ")", "]", "}", "`", "*",
+]);
+
+const fetchTtsAudio = async (
+  endpoint: string,
+  text: string,
+  signal: AbortSignal,
+): Promise<Blob> => {
+  const response = await fetch(`${API}${endpoint}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ text }),
+    signal,
+  });
+
+  if (!response.ok) {
+    throw new Error("Voice generation failed.");
+  }
+
+  return response.blob();
+};
+
+const endsWithAbbreviation = (text: string) => {
+  const match = /([A-Za-z]+)\s*$/.exec(text);
+
+  if (!match) return false;
+
+  const word = match[1].toLowerCase();
+
+  return SENTENCE_ABBREVIATIONS.has(word) || word.length === 1;
+};
+
+const endsWithListItemNumber = (text: string) => {
+  const lineStart = text.lastIndexOf("\n") + 1;
+
+  return /^\d+$/.test(text.slice(lineStart));
+};
+
 
 function App() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -66,6 +129,7 @@ function App() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
   const speechRunRef = useRef(0);
+  const speechAbortRef = useRef<AbortController | null>(null);
 
 
   const scrollToBottom = () => {
@@ -78,6 +142,9 @@ function App() {
 
   const stopAudio = useCallback(() => {
     speechRunRef.current += 1;
+    speechAbortRef.current?.abort();
+    speechAbortRef.current = null;
+
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current = null;
@@ -155,6 +222,8 @@ function App() {
 
   useEffect(() => {
     return () => {
+      speechAbortRef.current?.abort();
+
       if (audioRef.current) {
         audioRef.current.pause();
       }
@@ -169,49 +238,90 @@ function App() {
     };
   }, []);
 
+  const playAudioBlob = async (
+    blob: Blob,
+    speechRun: number,
+  ): Promise<boolean> => {
+    if (speechRunRef.current !== speechRun) return false;
+
+    const url = URL.createObjectURL(blob);
+    audioUrlRef.current = url;
+
+    const audio = new Audio(url);
+    audioRef.current = audio;
+
+    setSpeaking(true);
+    setStatus("Jarvis is speaking...");
+
+    const completed = await new Promise<boolean>((resolve) => {
+      let settled = false;
+
+      const finish = (playedToEnd: boolean) => {
+        if (settled) return;
+        settled = true;
+
+        audio.onended = null;
+        audio.onerror = null;
+        audio.onpause = null;
+
+        if (audioRef.current === audio) {
+          audioRef.current = null;
+        }
+
+        URL.revokeObjectURL(url);
+
+        if (audioUrlRef.current === url) {
+          audioUrlRef.current = null;
+        }
+
+        resolve(playedToEnd);
+      };
+
+      audio.onended = () => finish(true);
+      audio.onerror = () => finish(false);
+      audio.onpause = () => finish(false);
+
+      void audio.play().catch(() => finish(false));
+    });
+
+    if (speechRunRef.current === speechRun) {
+      setSpeaking(false);
+    }
+
+    return completed;
+  };
+
   const speak = async (text: string) => {
     if (!voiceEnabled || !text.trim()) return;
 
     stopAudio();
+
+    const speechRun = speechRunRef.current;
+    const controller = new AbortController();
+    speechAbortRef.current = controller;
+
     setSpeaking(true);
     setStatus("Jarvis is speaking...");
 
     try {
-      const response = await fetch(`${API}/api/voice/speak`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ text: text.slice(0, 5000) }),
-      });
-
-      if (!response.ok) {
-        throw new Error("Voice generation failed.");
-      }
-
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      audioUrlRef.current = url;
-
-      const audio = new Audio(url);
-      audioRef.current = audio;
-
-      audio.onended = () => {
-        stopAudio();
-        setStatus("Jarvis online");
-      };
-
-      audio.onerror = () => {
-        stopAudio();
-        setStatus("Audio playback failed");
-      };
-
-      await audio.play();
-    } catch (error) {
-      stopAudio();
-      setStatus(
-        error instanceof Error ? error.message : "Voice unavailable"
+      const blob = await fetchTtsAudio(
+        "/api/voice/speak",
+        text.slice(0, 5000),
+        controller.signal,
       );
+
+      const completed = await playAudioBlob(blob, speechRun);
+
+      if (speechRunRef.current === speechRun) {
+        setStatus(completed ? "Jarvis online" : "Audio playback failed");
+      }
+    } catch (error) {
+      if (speechRunRef.current === speechRun) {
+        setSpeaking(false);
+        setStatus(
+          error instanceof Error ? error.message : "Voice unavailable",
+        );
+      }
     }
   };
 
@@ -234,60 +344,15 @@ function App() {
 
     // Stop any previous speech and create a new speech run for this response.
     stopAudio();
-    const speechRun = ++speechRunRef.current;
+
+    const speechRun = speechRunRef.current;
+    const speechController = new AbortController();
+    speechAbortRef.current = speechController;
     const shouldSpeak = voiceEnabled;
 
     let fullResponse = "";
     let speechBuffer = "";
     let playbackChain: Promise<void> = Promise.resolve();
-
-    const playAudioBlob = async (blob: Blob) => {
-      if (speechRunRef.current !== speechRun) return;
-
-      const url = URL.createObjectURL(blob);
-      audioUrlRef.current = url;
-
-      const audio = new Audio(url);
-      audioRef.current = audio;
-
-      setSpeaking(true);
-      setStatus("Jarvis is speaking...");
-
-      await new Promise<void>((resolve) => {
-        let finished = false;
-
-        const finish = () => {
-          if (finished) return;
-          finished = true;
-
-          audio.onended = null;
-          audio.onerror = null;
-          audio.onpause = null;
-
-          if (audioRef.current === audio) {
-            audioRef.current = null;
-          }
-
-          URL.revokeObjectURL(url);
-
-          if (audioUrlRef.current === url) {
-            audioUrlRef.current = null;
-          }
-
-          resolve();
-        };
-
-        audio.onended = finish;
-        audio.onerror = finish;
-        audio.onpause = finish;
-
-        void audio.play().catch(finish);
-      });
-
-      if (speechRunRef.current === speechRun) {
-        setSpeaking(false);
-      }
-    };
 
     const enqueueSentence = (sentence: string) => {
       const cleanSentence = sentence.trim();
@@ -301,19 +366,11 @@ function App() {
       }
 
       // Generate audio as soon as a complete sentence is available.
-      const audioPromise = fetch(`${API}/api/voice/speak/sentence`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ text: cleanSentence }),
-      }).then(async (response) => {
-        if (!response.ok) {
-          throw new Error("Sentence voice generation failed.");
-        }
-
-        return response.blob();
-      });
+      const audioPromise = fetchTtsAudio(
+        "/api/voice/speak/sentence",
+        cleanSentence,
+        speechController.signal,
+      );
 
       // Keep playback in sentence order while audio generation overlaps.
       playbackChain = playbackChain.then(async () => {
@@ -322,7 +379,7 @@ function App() {
 
           if (speechRunRef.current !== speechRun) return;
 
-          await playAudioBlob(blob);
+          await playAudioBlob(blob, speechRun);
         } catch (error) {
           if (speechRunRef.current === speechRun) {
             console.error("Sentence audio error:", error);
@@ -332,19 +389,76 @@ function App() {
     };
 
     const extractCompleteSentences = () => {
-      const sentenceRegex = /[^.!?]+[.!?]+(?:["')\]]*)\s+/g;
+      const boundaries: number[] = [];
 
-      let match: RegExpExecArray | null;
-      let consumedLength = 0;
+      for (let i = 0; i < speechBuffer.length; i += 1) {
+        if (!".!?".includes(speechBuffer[i])) {
+          continue;
+        }
 
-      while ((match = sentenceRegex.exec(speechBuffer)) !== null) {
-        enqueueSentence(match[0]);
-        consumedLength = sentenceRegex.lastIndex;
+        let end = i;
+
+        while (
+          end + 1 < speechBuffer.length &&
+          ".!?".includes(speechBuffer[end + 1])
+        ) {
+          end += 1;
+        }
+
+        while (
+          end + 1 < speechBuffer.length &&
+          SENTENCE_CLOSERS.has(speechBuffer[end + 1])
+        ) {
+          end += 1;
+        }
+
+        const atEnd = end + 1 >= speechBuffer.length;
+        const nextChar = atEnd ? "" : speechBuffer[end + 1];
+        const before = speechBuffer.slice(0, i);
+
+        // Periods that belong to abbreviations ("Dr.", "e.g."), numbered
+        // markdown lists ("1. Item"), decimals ("3.14"), or a number whose
+        // continuation has not arrived yet do not end a sentence.
+        if (speechBuffer[i] === ".") {
+          const isListNumber =
+            /\s/.test(nextChar) && endsWithListItemNumber(before);
+
+          const isDecimalOrTruncatedNumber =
+            /\d$/.test(before) && (/\d/.test(nextChar) || atEnd);
+
+          if (
+            endsWithAbbreviation(before) ||
+            isListNumber ||
+            isDecimalOrTruncatedNumber
+          ) {
+            i = end;
+            continue;
+          }
+        }
+
+        // A punctuation run only completes a sentence when followed by
+        // whitespace or the end of the currently buffered text.
+        if (!atEnd && !/\s/.test(nextChar)) {
+          i = end;
+          continue;
+        }
+
+        boundaries.push(end);
+        i = end;
       }
 
-      if (consumedLength > 0) {
-        speechBuffer = speechBuffer.slice(consumedLength);
+      if (boundaries.length === 0) {
+        return;
       }
+
+      let consumed = 0;
+
+      for (const boundary of boundaries) {
+        enqueueSentence(speechBuffer.slice(consumed, boundary + 1));
+        consumed = boundary + 1;
+      }
+
+      speechBuffer = speechBuffer.slice(consumed);
     };
 
     try {
@@ -392,14 +506,24 @@ function App() {
 
         if (dataLines.length === 0) return;
 
-        const event = JSON.parse(dataLines.join("\n"));
+        let event: StreamEvent;
 
-        if (event.type === "start") {
+        try {
+          event = JSON.parse(dataLines.join("\n")) as StreamEvent;
+        } catch {
+          console.warn("Ignoring malformed stream event.");
+          return;
+        }
+
+        if (
+          event.type === "start" &&
+          typeof event.session_id === "number"
+        ) {
           setSessionId(event.session_id);
           setStatus("Jarvis is responding...");
         }
 
-        if (event.type === "chunk") {
+        if (event.type === "chunk" && typeof event.text === "string") {
           fullResponse += event.text;
 
           setMessages((previous) => {
@@ -425,7 +549,7 @@ function App() {
         if (event.type === "done") {
           completed = true;
 
-          if (event.response) {
+          if (typeof event.response === "string") {
             fullResponse = event.response;
 
             setMessages((previous) => {
@@ -573,19 +697,14 @@ function App() {
             body: formData,
           });
 
-          const data: {
-            text: string;
-            language: string;
-            language_probability: number;
-          } = await response.json();
+          const data: { text?: string; detail?: string } | null =
+            await response.json().catch(() => null);
 
           if (!response.ok) {
-            throw new Error(
-              "text" in data ? data.text : "Transcription failed."
-            );
+            throw new Error(data?.detail || "Transcription failed.");
           }
 
-          if (!data.text?.trim()) {
+          if (!data?.text?.trim()) {
             throw new Error("No speech was detected. Try recording again.");
           }
 
