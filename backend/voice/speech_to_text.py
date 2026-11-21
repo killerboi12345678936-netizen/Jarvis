@@ -76,3 +76,37 @@ def transcribe_audio(audio_bytes: bytes, suffix=".webm"):
     finally:
         if temp_path and Path(temp_path).exists():
             Path(temp_path).unlink()
+
+
+def transcribe_samples(samples, beam_size=1):
+    """Transcribe PCM float32 mono samples at 16 kHz."""
+
+    import numpy as np
+
+    if samples is None or len(samples) == 0:
+        return {"text": "", "language": "en", "language_probability": 0.0}
+
+    if isinstance(samples, (bytes, bytearray)):
+        samples = np.frombuffer(
+            bytes(samples),
+            dtype=np.int16,
+        ).astype(np.float32) / 32768.0
+
+    model = get_model()
+
+    segments, info = model.transcribe(
+        samples,
+        beam_size=beam_size,
+        vad_filter=True,
+    )
+
+    text = " ".join(
+        segment.text.strip()
+        for segment in segments
+    ).strip()
+
+    return {
+        "text": text,
+        "language": info.language,
+        "language_probability": info.language_probability,
+    }
