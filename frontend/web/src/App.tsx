@@ -1,35 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  Activity,
-  AudioLines,
-  ChevronDown,
-  CircleHelp,
-  Command,
-  Cpu,
-  Menu,
-  MessageSquare,
-  Mic,
-  Plus,
-  Search,
-  Settings,
-  ShieldCheck,
-  Sparkles,
-  Volume2,
-  VolumeX,
-  Send,
-  Square,
-  Bot,
-  User,
-  LoaderCircle,
-} from "lucide-react";
+import { Menu, Search } from "lucide-react";
 import "./App.css";
 
-const API = "http://localhost:8000";
+import { apiGet, API, fetchTtsAudio } from "./lib/api";
+import {
+  extractCompleteSentences,
+} from "./lib/segmentation";
+import type { VoiceTuning } from "./lib/voiceClient";
 
-type Message = {
-  role: "user" | "assistant";
-  content: string;
-};
+import { Composer } from "./components/Composer";
+import { LiveVoicePanel } from "./components/LiveVoicePanel";
+import { MessageList, type Message } from "./components/MessageList";
+import { ProviderToolbar } from "./components/ProviderToolbar";
+import { Sidebar, type PanelId, type SessionSummary } from "./components/Sidebar";
+import { MemoryPanel } from "./components/MemoryPanel";
+import { ActionsPanel } from "./components/ActionsPanel";
+import { IntegrationsPanel } from "./components/IntegrationsPanel";
+import { SettingsPanel } from "./components/SettingsPanel";
 
 type ProviderInfo = {
   configured: boolean;
@@ -52,64 +39,17 @@ type StreamEvent = {
   message?: string;
 };
 
-// Words after which a period does not end a sentence, plus single-letter
-// initials such as "J." or the "e." in "e.g.".
-const SENTENCE_ABBREVIATIONS = new Set([
-  "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc",
-  "eg", "ie", "fig", "approx", "dept", "est", "inc", "ltd", "co",
-  "corp", "rev", "hon", "capt", "sgt", "gen", "col", "lt", "mt",
-  "ft", "apt", "no", "al", "cf", "viz", "ph", "md", "min", "max",
-  "sec", "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep",
-  "sept", "oct", "nov", "dec",
-]);
-
-// Quotes, brackets, and markdown emphasis that may trail sentence punctuation.
-const SENTENCE_CLOSERS = new Set([
-  "\"", "'", ")", "]", "}", "`", "*",
-]);
-
-const fetchTtsAudio = async (
-  endpoint: string,
-  text: string,
-  signal: AbortSignal,
-): Promise<Blob> => {
-  const response = await fetch(`${API}${endpoint}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ text }),
-    signal,
-  });
-
-  if (!response.ok) {
-    throw new Error("Voice generation failed.");
-  }
-
-  return response.blob();
+type StoredMessage = {
+  role: string;
+  content: string;
 };
-
-const endsWithAbbreviation = (text: string) => {
-  const match = /([A-Za-z]+)\s*$/.exec(text);
-
-  if (!match) return false;
-
-  const word = match[1].toLowerCase();
-
-  return SENTENCE_ABBREVIATIONS.has(word) || word.length === 1;
-};
-
-const endsWithListItemNumber = (text: string) => {
-  const lineStart = text.lastIndexOf("\n") + 1;
-
-  return /^\d+$/.test(text.slice(lineStart));
-};
-
 
 function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [sessionId, setSessionId] = useState<number | null>(null);
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
 
   const [provider, setProvider] = useState("ollama");
   const [model, setModel] = useState("qwen2.5:3b");
@@ -122,23 +62,23 @@ function App() {
   const [voiceEnabled, setVoiceEnabled] = useState(true);
   const [recording, setRecording] = useState(false);
   const [status, setStatus] = useState("Connecting to Jarvis...");
+  const [activePanel, setActivePanel] = useState<PanelId | null>(null);
+  const [liveVoiceOpen, setLiveVoiceOpen] = useState(false);
+  const [pendingActions, setPendingActions] = useState(0);
+  const [tuning, setTuning] = useState<VoiceTuning>({
+    continuous: true,
+    speechThreshold: 0.015,
+    silenceMs: 900,
+    minSpeechMs: 300,
+    bargeInThreshold: 0.035,
+  });
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
   const speechRunRef = useRef(0);
   const speechAbortRef = useRef<AbortController | null>(null);
-
-
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
-
-  useEffect(() => {
-    scrollToBottom();
-  }, [messages, loading]);
 
   const stopAudio = useCallback(() => {
     speechRunRef.current += 1;
@@ -158,15 +98,99 @@ function App() {
     setSpeaking(false);
   }, []);
 
-  const loadProviders = useCallback(async () => {
-    try {
-      const response = await fetch(`${API}/api/providers/`);
+  const playAudioBlob = useCallback(
+    async (blob: Blob, speechRun: number): Promise<boolean> => {
+      if (speechRunRef.current !== speechRun) return false;
 
-      if (!response.ok) {
-        throw new Error("Could not retrieve providers.");
+      const url = URL.createObjectURL(blob);
+      audioUrlRef.current = url;
+
+      const audio = new Audio(url);
+      audioRef.current = audio;
+
+      setSpeaking(true);
+      setStatus("Jarvis is speaking...");
+
+      const completed = await new Promise<boolean>((resolve) => {
+        let settled = false;
+
+        const finish = (playedToEnd: boolean) => {
+          if (settled) return;
+          settled = true;
+
+          audio.onended = null;
+          audio.onerror = null;
+          audio.onpause = null;
+
+          if (audioRef.current === audio) {
+            audioRef.current = null;
+          }
+
+          URL.revokeObjectURL(url);
+
+          if (audioUrlRef.current === url) {
+            audioUrlRef.current = null;
+          }
+
+          resolve(playedToEnd);
+        };
+
+        audio.onended = () => finish(true);
+        audio.onerror = () => finish(false);
+        audio.onpause = () => finish(false);
+
+        void audio.play().catch(() => finish(false));
+      });
+
+      if (speechRunRef.current === speechRun) {
+        setSpeaking(false);
       }
 
-      const data: ProvidersResponse = await response.json();
+      return completed;
+    },
+    [],
+  );
+
+  const speak = useCallback(
+    async (text: string) => {
+      if (!voiceEnabled || !text.trim()) return;
+
+      stopAudio();
+
+      const speechRun = speechRunRef.current;
+      const controller = new AbortController();
+      speechAbortRef.current = controller;
+
+      setSpeaking(true);
+      setStatus("Jarvis is speaking...");
+
+      try {
+        const blob = await fetchTtsAudio(
+          "/api/voice/speak",
+          text.slice(0, 5000),
+          controller.signal,
+        );
+
+        const completed = await playAudioBlob(blob, speechRun);
+
+        if (speechRunRef.current === speechRun) {
+          setStatus(completed ? "Jarvis online" : "Audio playback failed");
+        }
+      } catch (error) {
+        if (speechRunRef.current === speechRun) {
+          setSpeaking(false);
+          setStatus(
+            error instanceof Error ? error.message : "Voice unavailable",
+          );
+        }
+      }
+    },
+    [voiceEnabled, stopAudio, playAudioBlob],
+  );
+
+  const loadProviders = useCallback(async () => {
+    try {
+      const data = await apiGet<ProvidersResponse>("/api/providers/");
 
       setProviders(data.providers);
 
@@ -192,13 +216,9 @@ function App() {
     }
 
     try {
-      const response = await fetch(`${API}/api/providers/ollama/models`);
-
-      if (!response.ok) {
-        throw new Error("Could not retrieve Ollama models.");
-      }
-
-      const data: { models: string[] } = await response.json();
+      const data = await apiGet<{ models: string[] }>(
+        "/api/providers/ollama/models",
+      );
 
       setModels(data.models);
 
@@ -210,6 +230,30 @@ function App() {
     }
   }, [provider, model]);
 
+  const loadSessions = useCallback(async () => {
+    try {
+      const data = await apiGet<{ sessions: SessionSummary[] }>(
+        "/api/sessions/",
+      );
+
+      setSessions(data.sessions);
+    } catch {
+      // Sidebar history is best-effort.
+    }
+  }, []);
+
+  const loadPendingActions = useCallback(async () => {
+    try {
+      const data = await apiGet<{ actions: { id: number }[] }>(
+        "/api/actions/?status=pending",
+      );
+
+      setPendingActions(data.actions.length);
+    } catch {
+      setPendingActions(0);
+    }
+  }, []);
+
   useEffect(() => {
     void loadProviders();
   }, [loadProviders]);
@@ -217,8 +261,16 @@ function App() {
   useEffect(() => {
     if (connected) {
       void loadModels();
+      void loadSessions();
+      void loadPendingActions();
     }
-  }, [connected, loadModels]);
+  }, [connected, loadModels, loadSessions, loadPendingActions]);
+
+  useEffect(() => {
+    const interval = setInterval(() => void loadPendingActions(), 10000);
+
+    return () => clearInterval(interval);
+  }, [loadPendingActions]);
 
   useEffect(() => {
     return () => {
@@ -238,93 +290,36 @@ function App() {
     };
   }, []);
 
-  const playAudioBlob = async (
-    blob: Blob,
-    speechRun: number,
-  ): Promise<boolean> => {
-    if (speechRunRef.current !== speechRun) return false;
-
-    const url = URL.createObjectURL(blob);
-    audioUrlRef.current = url;
-
-    const audio = new Audio(url);
-    audioRef.current = audio;
-
-    setSpeaking(true);
-    setStatus("Jarvis is speaking...");
-
-    const completed = await new Promise<boolean>((resolve) => {
-      let settled = false;
-
-      const finish = (playedToEnd: boolean) => {
-        if (settled) return;
-        settled = true;
-
-        audio.onended = null;
-        audio.onerror = null;
-        audio.onpause = null;
-
-        if (audioRef.current === audio) {
-          audioRef.current = null;
-        }
-
-        URL.revokeObjectURL(url);
-
-        if (audioUrlRef.current === url) {
-          audioUrlRef.current = null;
-        }
-
-        resolve(playedToEnd);
-      };
-
-      audio.onended = () => finish(true);
-      audio.onerror = () => finish(false);
-      audio.onpause = () => finish(false);
-
-      void audio.play().catch(() => finish(false));
-    });
-
-    if (speechRunRef.current === speechRun) {
-      setSpeaking(false);
-    }
-
-    return completed;
-  };
-
-  const speak = async (text: string) => {
-    if (!voiceEnabled || !text.trim()) return;
-
-    stopAudio();
-
-    const speechRun = speechRunRef.current;
-    const controller = new AbortController();
-    speechAbortRef.current = controller;
-
-    setSpeaking(true);
-    setStatus("Jarvis is speaking...");
-
+  const selectSession = async (id: number) => {
     try {
-      const blob = await fetchTtsAudio(
-        "/api/voice/speak",
-        text.slice(0, 5000),
-        controller.signal,
+      const data = await apiGet<{
+        session: SessionSummary;
+        messages: StoredMessage[];
+      }>(`/api/sessions/${id}`);
+
+      stopAudio();
+
+      setMessages(
+        data.messages
+          .filter(
+            (message) =>
+              message.role === "user" || message.role === "assistant",
+          )
+          .map((message) => ({
+            role: message.role as Message["role"],
+            content: message.content,
+          })),
       );
 
-      const completed = await playAudioBlob(blob, speechRun);
-
-      if (speechRunRef.current === speechRun) {
-        setStatus(completed ? "Jarvis online" : "Audio playback failed");
-      }
+      setSessionId(id);
+      setActiveSessionId(id);
+      setStatus(`Viewing session #${id}`);
     } catch (error) {
-      if (speechRunRef.current === speechRun) {
-        setSpeaking(false);
-        setStatus(
-          error instanceof Error ? error.message : "Voice unavailable",
-        );
-      }
+      setStatus(
+        error instanceof Error ? error.message : "Could not load session.",
+      );
     }
   };
-
 
   const sendMessage = async (messageOverride?: string) => {
     const message = (messageOverride ?? input).trim();
@@ -342,7 +337,6 @@ function App() {
     setLoading(true);
     setStatus("Jarvis is thinking...");
 
-    // Stop any previous speech and create a new speech run for this response.
     stopAudio();
 
     const speechRun = speechRunRef.current;
@@ -365,14 +359,12 @@ function App() {
         return;
       }
 
-      // Generate audio as soon as a complete sentence is available.
       const audioPromise = fetchTtsAudio(
         "/api/voice/speak/sentence",
         cleanSentence,
         speechController.signal,
       );
 
-      // Keep playback in sentence order while audio generation overlaps.
       playbackChain = playbackChain.then(async () => {
         try {
           const blob = await audioPromise;
@@ -388,92 +380,20 @@ function App() {
       });
     };
 
-    const extractCompleteSentences = () => {
-      const boundaries: number[] = [];
-
-      for (let i = 0; i < speechBuffer.length; i += 1) {
-        if (!".!?".includes(speechBuffer[i])) {
-          continue;
-        }
-
-        let end = i;
-
-        while (
-          end + 1 < speechBuffer.length &&
-          ".!?".includes(speechBuffer[end + 1])
-        ) {
-          end += 1;
-        }
-
-        while (
-          end + 1 < speechBuffer.length &&
-          SENTENCE_CLOSERS.has(speechBuffer[end + 1])
-        ) {
-          end += 1;
-        }
-
-        const atEnd = end + 1 >= speechBuffer.length;
-        const nextChar = atEnd ? "" : speechBuffer[end + 1];
-        const before = speechBuffer.slice(0, i);
-
-        // Periods that belong to abbreviations ("Dr.", "e.g."), numbered
-        // markdown lists ("1. Item"), decimals ("3.14"), or a number whose
-        // continuation has not arrived yet do not end a sentence.
-        if (speechBuffer[i] === ".") {
-          const isListNumber =
-            /\s/.test(nextChar) && endsWithListItemNumber(before);
-
-          const isDecimalOrTruncatedNumber =
-            /\d$/.test(before) && (/\d/.test(nextChar) || atEnd);
-
-          if (
-            endsWithAbbreviation(before) ||
-            isListNumber ||
-            isDecimalOrTruncatedNumber
-          ) {
-            i = end;
-            continue;
-          }
-        }
-
-        // A punctuation run only completes a sentence when followed by
-        // whitespace or the end of the currently buffered text.
-        if (!atEnd && !/\s/.test(nextChar)) {
-          i = end;
-          continue;
-        }
-
-        boundaries.push(end);
-        i = end;
-      }
-
-      if (boundaries.length === 0) {
-        return;
-      }
-
-      let consumed = 0;
-
-      for (const boundary of boundaries) {
-        enqueueSentence(speechBuffer.slice(consumed, boundary + 1));
-        consumed = boundary + 1;
-      }
-
-      speechBuffer = speechBuffer.slice(consumed);
-    };
-
     try {
       const response = await fetch(`${API}/api/chat/stream`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            message,
+            session_id: sessionId,
+            provider,
+            model,
+          }),
         },
-        body: JSON.stringify({
-          message,
-          session_id: sessionId,
-          provider,
-          model,
-        }),
-      });
+      );
 
       if (!response.ok) {
         let errorMessage = "Chat request failed.";
@@ -520,7 +440,9 @@ function App() {
           typeof event.session_id === "number"
         ) {
           setSessionId(event.session_id);
+          setActiveSessionId(event.session_id);
           setStatus("Jarvis is responding...");
+          void loadSessions();
         }
 
         if (event.type === "chunk" && typeof event.text === "string") {
@@ -542,7 +464,15 @@ function App() {
 
           if (shouldSpeak) {
             speechBuffer += event.text;
-            extractCompleteSentences();
+
+            const { sentences, remaining } =
+              extractCompleteSentences(speechBuffer);
+
+            speechBuffer = remaining;
+
+            for (const sentence of sentences) {
+              enqueueSentence(sentence);
+            }
           }
         }
 
@@ -600,13 +530,11 @@ function App() {
         throw new Error("The streaming connection ended unexpectedly.");
       }
 
-      // Flush the final text, even if it doesn't end with punctuation.
       if (speechBuffer.trim()) {
         enqueueSentence(speechBuffer);
         speechBuffer = "";
       }
 
-      // Update the status when the final queued sentence finishes playing.
       if (shouldSpeak) {
         void playbackChain.then(() => {
           if (speechRunRef.current === speechRun) {
@@ -712,7 +640,7 @@ function App() {
           await sendMessage(data.text);
         } catch (error) {
           setStatus(
-            error instanceof Error ? error.message : "Transcription failed"
+            error instanceof Error ? error.message : "Transcription failed",
           );
         }
       };
@@ -734,9 +662,62 @@ function App() {
   const newConversation = () => {
     setMessages([]);
     setSessionId(null);
+    setActiveSessionId(null);
     setInput("");
     stopAudio();
     setStatus("New conversation ready");
+  };
+
+  // Live voice mode mirrors the spoken conversation into the chat area.
+  const handleVoiceTranscript = (text: string) => {
+    if (!text.trim()) return;
+
+    setMessages((previous) => [
+      ...previous,
+      { role: "user", content: text },
+      { role: "assistant", content: "" },
+    ]);
+  };
+
+  const handleVoiceSentence = (text: string) => {
+    setMessages((previous) => {
+      const updated = [...previous];
+      const lastIndex = updated.length - 1;
+
+      if (updated[lastIndex]?.role === "assistant") {
+        updated[lastIndex] = {
+          ...updated[lastIndex],
+          content: updated[lastIndex].content + text,
+        };
+      }
+
+      return updated;
+    });
+  };
+
+  const handleVoiceResponseDone = (
+    response: string,
+    interrupted: boolean,
+  ) => {
+    setMessages((previous) => {
+      const updated = [...previous];
+      const lastIndex = updated.length - 1;
+
+      if (updated[lastIndex]?.role === "assistant") {
+        const content = response || updated[lastIndex].content;
+
+        updated[lastIndex] = {
+          ...updated[lastIndex],
+          content: interrupted
+            ? `${content} (interrupted)`
+            : content,
+        };
+      }
+
+      return updated;
+    });
+
+    void loadSessions();
   };
 
   const handleProviderChange = (nextProvider: string) => {
@@ -749,64 +730,16 @@ function App() {
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-icon">
-            <Command size={23} />
-          </div>
-          <div>
-            <h1>JARVIS</h1>
-            <span>PERSONAL AI SYSTEM</span>
-          </div>
-        </div>
-
-        <button className="new-chat" onClick={newConversation}>
-          <Plus size={17} />
-          New conversation
-        </button>
-
-        <div className="sidebar-section">
-          <span className="section-label">WORKSPACE</span>
-          <div className="sidebar-item active">
-            <MessageSquare size={17} />
-            <span>Chat</span>
-          </div>
-          <div className="sidebar-item">
-            <Activity size={17} />
-            <span>Activity</span>
-          </div>
-          <div className="sidebar-item">
-            <Cpu size={17} />
-            <span>AI Providers</span>
-          </div>
-        </div>
-
-        <div className="sidebar-section conversations">
-          <span className="section-label">CURRENT SESSION</span>
-          <p className="empty-history">
-            {sessionId ? `Session #${sessionId}` : "No active session"}
-          </p>
-        </div>
-
-        <div className="sidebar-bottom">
-          <div className="sidebar-item">
-            <Settings size={17} />
-            <span>Settings</span>
-          </div>
-          <div className="sidebar-item">
-            <CircleHelp size={17} />
-            <span>Help</span>
-          </div>
-          <div className="profile">
-            <div className="profile-avatar">J</div>
-            <div>
-              <strong>Jarvis</strong>
-              <span>Local assistant</span>
-            </div>
-            <ChevronDown size={16} />
-          </div>
-        </div>
-      </aside>
+      <Sidebar
+        connected={connected}
+        sessionId={sessionId}
+        sessions={sessions}
+        activeSessionId={activeSessionId}
+        pendingActions={pendingActions}
+        onNewConversation={newConversation}
+        onOpenPanel={(panel) => setActivePanel(panel)}
+        onSelectSession={(id) => void selectSession(id)}
+      />
 
       <main className="main-panel">
         <header className="topbar">
@@ -840,235 +773,83 @@ function App() {
           </div>
         </header>
 
-        <div className="provider-toolbar">
-          <label>
-            AI PROVIDER
-            <select
-              value={provider}
-              onChange={(event) => handleProviderChange(event.target.value)}
-            >
-              {Object.entries(providers).map(([name, info]) => (
-                <option
-                  key={name}
-                  value={name}
-                  disabled={!info.configured || !info.online}
-                >
-                  {name.toUpperCase()}
-                  {!info.online ? " (offline)" : ""}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          {provider === "ollama" && (
-            <label>
-              MODEL
-              <select
-                value={model}
-                onChange={(event) => setModel(event.target.value)}
-              >
-                {models.map((name) => (
-                  <option key={name} value={name}>
-                    {name}
-                  </option>
-                ))}
-              </select>
-            </label>
-          )}
-
-          <button
-            className={`voice-toggle ${voiceEnabled ? "enabled" : ""}`}
-            onClick={() => {
-              setVoiceEnabled((value) => !value);
-              if (voiceEnabled) stopAudio();
-            }}
-            title="Toggle voice responses"
-          >
-            {voiceEnabled ? <Volume2 size={17} /> : <VolumeX size={17} />}
-            Voice {voiceEnabled ? "on" : "off"}
-          </button>
-        </div>
+        <ProviderToolbar
+          provider={provider}
+          model={model}
+          providers={providers}
+          models={models}
+          voiceEnabled={voiceEnabled}
+          onProviderChange={handleProviderChange}
+          onModelChange={setModel}
+          onToggleVoice={() => {
+            setVoiceEnabled((value) => !value);
+            if (voiceEnabled) stopAudio();
+          }}
+          onOpenLiveVoice={() => setLiveVoiceOpen(true)}
+        />
 
         <section className="chat-area conversation-area">
-          {messages.length === 0 ? (
-            <div className="welcome">
-              <div className="orb-container">
-                <div className="orb-ring ring-one" />
-                <div className="orb-ring ring-two" />
-                <div className="orb-ring ring-three" />
-                <div className="orb">
-                  <AudioLines size={43} strokeWidth={1.3} />
-                </div>
-              </div>
-
-              <div className="welcome-eyebrow">
-                <Sparkles size={14} />
-                PERSONAL AI ASSISTANT
-              </div>
-
-              <h1>
-                At your service<span>.</span>
-              </h1>
-
-              <p className="welcome-description">
-                Your personal intelligence system is online.
-                <br />
-                Start a conversation with Jarvis.
-              </p>
-
-              <div className="capability-grid">
-                <div className="capability">
-                  <div className="capability-icon">
-                    <MessageSquare size={19} />
-                  </div>
-                  <div>
-                    <strong>Intelligent chat</strong>
-                    <span>AI-powered conversations</span>
-                  </div>
-                </div>
-
-                <div className="capability">
-                  <div className="capability-icon">
-                    <Volume2 size={19} />
-                  </div>
-                  <div>
-                    <strong>Voice responses</strong>
-                    <span>Powered by Piper TTS</span>
-                  </div>
-                </div>
-
-                <div className="capability">
-                  <div className="capability-icon">
-                    <ShieldCheck size={19} />
-                  </div>
-                  <div>
-                    <strong>Secure actions</strong>
-                    <span>Permission-based execution</span>
-                  </div>
-                </div>
-
-                <div className="capability">
-                  <div className="capability-icon">
-                    <Cpu size={19} />
-                  </div>
-                  <div>
-                    <strong>Local intelligence</strong>
-                    <span>Your own AI infrastructure</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          ) : (
-            <div className="message-list">
-              {messages.map((message, index) => (
-                <div
-                  className={`message-row ${message.role}`}
-                  key={`${index}-${message.role}`}
-                >
-                  <div className="message-avatar">
-                    {message.role === "assistant" ? (
-                      <Bot size={19} />
-                    ) : (
-                      <User size={19} />
-                    )}
-                  </div>
-                  <div className="message-content">
-                    <span className="message-author">
-                      {message.role === "assistant" ? "JARVIS" : "YOU"}
-                    </span>
-                    <p>{message.content}</p>
-                    {message.role === "assistant" && (
-                      <button
-                        className="message-speak"
-                        onClick={() => void speak(message.content)}
-                        title="Read this response aloud"
-                      >
-                        <Volume2 size={15} />
-                        Read aloud
-                      </button>
-                    )}
-                  </div>
-                </div>
-              ))}
-
-              {loading && (
-                <div className="message-row assistant">
-                  <div className="message-avatar">
-                    <Bot size={19} />
-                  </div>
-                  <div className="message-content">
-                    <span className="message-author">JARVIS</span>
-                    <p className="thinking-indicator">
-                      <LoaderCircle size={16} className="spin" />
-                      Thinking...
-                    </p>
-                  </div>
-                </div>
-              )}
-              <div ref={messagesEndRef} />
-            </div>
-          )}
+          <MessageList
+            messages={messages}
+            loading={loading}
+            onSpeak={(text) => void speak(text)}
+          />
         </section>
 
-        <footer className="composer-area">
-          <div className="composer">
-            <input
-              id="jarvis-chat-input"
-              name="message"
-              type="text"
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  void sendMessage();
-                }
-              }}
-              placeholder="Message Jarvis..."
-              disabled={loading || recording}
-            />
-
-            <div className="composer-actions">
-              {speaking && (
-                <button
-                  className="icon-button"
-                  onClick={stopAudio}
-                  title="Stop speaking"
-                >
-                  <Square size={16} />
-                </button>
-              )}
-
-              <button
-                className={`icon-button ${recording ? "recording" : ""}`}
-                onClick={recording ? stopRecording : startRecording}
-                disabled={!connected || loading}
-                title={recording ? "Stop recording" : "Start voice input"}
-              >
-                {recording ? <Square size={17} /> : <Mic size={19} />}
-              </button>
-
-              <button
-                className="send-button"
-                onClick={() => void sendMessage()}
-                disabled={!input.trim() || loading || !connected}
-                title="Send message"
-              >
-                <Send size={18} />
-              </button>
-            </div>
-          </div>
-
-          <div className="composer-caption">
-            <span>JARVIS AI Â· V1.0</span>
-            <span>
-              {recording
-                ? "Recording Â· press stop when finished"
-                : "Text and voice interface"}
-            </span>
-          </div>
-        </footer>
+        <Composer
+          input={input}
+          loading={loading}
+          recording={recording}
+          speaking={speaking}
+          connected={connected}
+          onInputChange={setInput}
+          onSend={() => void sendMessage()}
+          onStopSpeaking={stopAudio}
+          onToggleRecording={() =>
+            void (recording ? stopRecording() : startRecording())
+          }
+        />
       </main>
+
+      {liveVoiceOpen && (
+        <LiveVoicePanel
+          onClose={() => setLiveVoiceOpen(false)}
+          tuning={tuning}
+          onTuningChange={(patch) => setTuning((previous) => ({
+            ...previous,
+            ...patch,
+          }))}
+          onTranscript={handleVoiceTranscript}
+          onSentence={handleVoiceSentence}
+          onResponseDone={handleVoiceResponseDone}
+        />
+      )}
+
+      {activePanel === "memory" && (
+        <MemoryPanel onClose={() => setActivePanel(null)} />
+      )}
+
+      {activePanel === "actions" && (
+        <ActionsPanel
+          onClose={() => setActivePanel(null)}
+          onChanged={() => void loadPendingActions()}
+        />
+      )}
+
+      {activePanel === "integrations" && (
+        <IntegrationsPanel onClose={() => setActivePanel(null)} />
+      )}
+
+      {activePanel === "settings" && (
+        <SettingsPanel
+          onClose={() => setActivePanel(null)}
+          tuning={tuning}
+          onTuningChange={(patch) => setTuning((previous) => ({
+            ...previous,
+            ...patch,
+          }))}
+        />
+      )}
     </div>
   );
 }
