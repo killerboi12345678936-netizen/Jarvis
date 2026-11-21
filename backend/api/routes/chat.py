@@ -13,6 +13,10 @@ from backend.memory.database import (
     get_messages,
     save_message,
 )
+from backend.memory.retrieval import (
+    find_relevant_memories,
+    memory_context_block,
+)
 from backend.providers.manager import (
     provider_manager,
     ProviderError,
@@ -73,10 +77,22 @@ async def prepare_chat(request: ChatRequest):
         limit=settings.history_limit,
     )
 
+    system_prompt = settings.system_prompt
+
+    memories = await find_relevant_memories(
+        request.message,
+        limit=settings.memory_context_limit,
+    )
+
+    memory_block = memory_context_block(memories)
+
+    if memory_block:
+        system_prompt = f"{system_prompt}\n\n{memory_block}"
+
     messages = [
         {
             "role": "system",
-            "content": settings.system_prompt,
+            "content": system_prompt,
         }
     ]
 

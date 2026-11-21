@@ -1,14 +1,16 @@
 
-import os
 import tempfile
 from pathlib import Path
 
+from backend.core.config import settings
+
+from backend.core.config import settings
 from faster_whisper import WhisperModel
 
 
-MODEL_SIZE = os.getenv("WHISPER_MODEL", "base")
-DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
-COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+MODEL_SIZE = settings.whisper_model
+DEVICE = settings.whisper_device
+COMPUTE_TYPE = settings.whisper_compute_type
 
 _model = None
 
@@ -24,6 +26,10 @@ def get_model():
         )
 
     return _model
+
+
+def preload_model():
+    get_model()
 
 
 def transcribe_audio(audio_bytes: bytes, suffix=".webm"):

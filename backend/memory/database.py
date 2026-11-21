@@ -4,6 +4,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from backend.memory.textutils import text_similarity
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
@@ -177,6 +179,28 @@ async def add_memory(content, category="general"):
         )
         await db.commit()
         return cursor.lastrowid
+
+
+async def add_memory_dedup(content, category="general", duplicate_threshold=0.8):
+    normalized = " ".join(content.split())
+
+    existing = await get_memories(limit=500)
+
+    for memory in existing:
+        if text_similarity(normalized, memory["content"]) >= duplicate_threshold:
+            return {
+                "id": memory["id"],
+                "duplicate": True,
+                "existing": memory,
+            }
+
+    memory_id = await add_memory(normalized, category)
+
+    return {
+        "id": memory_id,
+        "duplicate": False,
+        "existing": None,
+    }
 
 
 async def get_memories(category=None, search=None, limit=100):

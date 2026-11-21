@@ -42,5 +42,48 @@ class Settings:
         "nvidia": os.getenv("NVIDIA_MODEL", "openai/gpt-oss-20b"),
     }
 
+    # ---- Memory ----
+    memory_context_limit = int(os.getenv("MEMORY_CONTEXT_LIMIT", "6"))
+
+    # ---- Voice ----
+    whisper_model = os.getenv("WHISPER_MODEL", "base")
+    whisper_device = os.getenv("WHISPER_DEVICE", "cpu")
+    whisper_compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+    whisper_preload = os.getenv("WHISPER_PRELOAD", "0") == "1"
+
+    voice_sample_rate = int(os.getenv("VOICE_SAMPLE_RATE", "16000"))
+
+    vad_speech_threshold = float(os.getenv("VAD_SPEECH_THRESHOLD", "0.015"))
+    vad_silence_ms = int(os.getenv("VAD_SILENCE_MS", "900"))
+    vad_min_speech_ms = int(os.getenv("VAD_MIN_SPEECH_MS", "300"))
+    vad_barge_in_threshold = float(
+        os.getenv("VAD_BARGE_IN_THRESHOLD", "0.035")
+    )
+
+    # ---- Telegram (read-only study groups) ----
+    telegram_api_id = os.getenv("TELEGRAM_API_ID", "")
+    telegram_api_hash = os.getenv("TELEGRAM_API_HASH", "")
+    telegram_session = os.getenv("TELEGRAM_SESSION", "")
+
+    telegram_groups = {
+        "mathematics": os.getenv("TELEGRAM_GROUP_MATH", ""),
+        "physics": os.getenv("TELEGRAM_GROUP_PHYSICS", ""),
+        "chemistry": os.getenv("TELEGRAM_GROUP_CHEMISTRY", ""),
+    }
+
+    # ---- Calendar ----
+    calendar_ics_url = os.getenv("CALENDAR_ICS_URL", "")
+    calendar_ics_file = os.getenv("CALENDAR_ICS_FILE", "")
+
+    # ---- Desktop ----
+    desktop_allowed_apps = {
+        pair.split("=", 1)[0].strip().lower(): pair.split("=", 1)[1].strip()
+        for pair in os.getenv(
+            "DESKTOP_ALLOWED_APPS",
+            "notepad=notepad,calculator=calc,paint=mspaint",
+        ).split(",")
+        if "=" in pair
+    }
+
 
 settings = Settings()

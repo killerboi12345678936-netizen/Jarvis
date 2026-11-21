@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from backend.memory.database import (
-    add_memory,
+    add_memory_dedup,
     get_memories,
     update_memory,
     delete_memory,
@@ -34,14 +34,15 @@ class MemoryUpdate(BaseModel):
 
 @router.post("/")
 async def create_memory(request: MemoryCreate):
-    memory_id = await add_memory(
+    result = await add_memory_dedup(
         request.content,
         request.category,
     )
 
     return {
         "success": True,
-        "memory_id": memory_id,
+        "memory_id": result["id"],
+        "duplicate": result["duplicate"],
     }
 
 

@@ -3,9 +3,11 @@ from contextlib import asynccontextmanager
 from backend.api.routes import chat, providers
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from backend.api.routes import actions
 from backend.api.routes import voice
 
+from backend.core.config import settings
 from backend.memory.database import init_db
 
 
@@ -13,6 +15,13 @@ from backend.memory.database import init_db
 async def lifespan(app: FastAPI):
     await init_db()
     print("Jarvis database initialized.")
+
+    if settings.whisper_preload:
+        from backend.voice.speech_to_text import preload_model
+
+        await run_in_threadpool(preload_model)
+        print("Whisper model preloaded.")
+
     yield
     print("Jarvis server shutting down.")
 
