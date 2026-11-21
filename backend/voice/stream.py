@@ -12,6 +12,8 @@ from backend.api.routes.chat import ChatRequest, prepare_chat
 from backend.core.config import settings
 from backend.memory.database import save_message
 from backend.providers.manager import provider_manager, ProviderError
+from backend.tools.parser import ToolStreamFilter
+from backend.tools.service import process_tool_calls
 from backend.voice.sentences import extract_complete_sentences
 from backend.voice.speech_to_text import transcribe_samples
 from backend.voice.text_to_speech import synthesize_sentence
@@ -215,60 +217,144 @@ async def _run_pipeline(websocket, send_json, session, pcm_bytes):
         await send_json({"type": "state", "state": "thinking"})
 
         full_response = ""
-        pending_text = ""
+        pending_actions = []
+        round_messages = list(messages)
         sentence_index = 0
         started_speaking = False
 
-        async for chunk in provider_manager.stream(
-            messages=messages,
-            provider=provider,
-            model=model,
-        ):
-            if cancel.is_set():
-                break
+        rounds = max(1, settings.tool_max_rounds)
+        interrupted = False
 
-            if not chunk:
-                continue
+        for _ in range(rounds):
+            stream_filter = ToolStreamFilter()
+            round_text = ""
+            pending_text = ""
 
-            full_response += chunk
-            pending_text += chunk
-
-            sentences, pending_text = extract_complete_sentences(
-                pending_text,
-            )
-
-            for sentence in sentences:
-                if cancel.is_set():
+            async for chunk in provider_manager.stream(
+                messages=round_messages,
+                provider=provider,
+                model=model,
+            ):
+                if session.cancel_event.is_set():
+                    interrupted = True
                     break
 
+                if not chunk:
+                    continue
+
+                round_text += chunk
+
+                visible = stream_filter.feed(chunk)
+
+                if visible:
+                    full_response += visible
+                    pending_text += visible
+
+                    sentences, pending_text = (
+                        extract_complete_sentences(pending_text)
+                    )
+
+                    for sentence in sentences:
+                        if session.cancel_event.is_set():
+                            interrupted = True
+                            break
+
+                        if not started_speaking:
+                            started_speaking = True
+                            await send_json({
+                                "type": "state",
+                                "state": "speaking",
+                            })
+
+                        await _speak_sentence(
+                            websocket,
+                            send_json,
+                            session,
+                            sentence,
+                            sentence_index,
+                        )
+                        sentence_index += 1
+
+            if interrupted:
+                break
+
+            tail = stream_filter.finish()
+
+            if tail:
+                full_response += tail
+                pending_text += tail
+
+                sentences, _ = extract_complete_sentences(pending_text)
+
+                for sentence in sentences:
+                    if session.cancel_event.is_set():
+                        interrupted = True
+                        break
+
+                    if not started_speaking:
+                        await send_json({
+                            "type": "state",
+                            "state": "speaking",
+                        })
+                        started_speaking = True
+
+                    await _speak_sentence(
+                        websocket,
+                        send_json,
+                        session,
+                        sentence,
+                        sentence_index,
+                    )
+                    sentence_index += 1
+
+            if interrupted:
+                break
+
+            if not stream_filter.tool_calls:
+                break
+
+            follow_up_parts, actions, _results = (
+                await process_tool_calls(stream_filter.tool_calls)
+            )
+
+            pending_actions.extend(actions)
+
+            if pending_actions:
+                note = (
+                    "I have proposed an action that needs your "
+                    "approval in the actions panel."
+                )
+
                 if not started_speaking:
+                    await send_json({"type": "state", "state": "speaking"})
                     started_speaking = True
-                    await send_json({
-                        "type": "state",
-                        "state": "speaking",
-                    })
 
                 await _speak_sentence(
                     websocket,
                     send_json,
                     session,
-                    sentence,
+                    note,
                     sentence_index,
                 )
                 sentence_index += 1
 
-        if not cancel.is_set() and pending_text.strip():
-            if not started_speaking:
-                await send_json({"type": "state", "state": "speaking"})
+                break
 
-            await _speak_sentence(
-                websocket,
-                send_json,
-                session,
-                pending_text,
-                sentence_index,
-            )
-            sentence_index += 1
+            if not follow_up_parts:
+                break
+
+            round_messages.append({
+                "role": "assistant",
+                "content": round_text,
+            })
+
+            round_messages.append({
+                "role": "user",
+                "content": (
+                    "\n".join(follow_up_parts)
+                    + "\nUse the results above to continue your answer."
+                ),
+            })
 
         cleaned_response = full_response.strip()
 

@@ -45,6 +45,10 @@ class Settings:
     # ---- Memory ----
     memory_context_limit = int(os.getenv("MEMORY_CONTEXT_LIMIT", "6"))
 
+    # ---- Tools ----
+    tools_enabled = os.getenv("TOOLS_ENABLED", "1") == "1"
+    tool_max_rounds = int(os.getenv("TOOL_MAX_ROUNDS", "2"))
+
     # ---- Voice ----
     whisper_model = os.getenv("WHISPER_MODEL", "base")
     whisper_device = os.getenv("WHISPER_DEVICE", "cpu")

@@ -40,7 +40,10 @@ class ProviderManager:
             if configured:
                 try:
                     if provider == "ollama":
-                        async with httpx.AsyncClient(timeout=5) as client:
+                        async with httpx.AsyncClient(
+                            timeout=5,
+                            trust_env=False,
+                        ) as client:
                             response = await client.get(
                                 f"{settings.ollama_url}/api/tags"
                             )
@@ -62,7 +65,10 @@ class ProviderManager:
 
     async def list_ollama_models(self):
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with httpx.AsyncClient(
+                timeout=10,
+                trust_env=False,
+            ) as client:
                 response = await client.get(
                     f"{settings.ollama_url}/api/tags"
                 )
@@ -135,7 +141,10 @@ class ProviderManager:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=180) as client:
+            async with httpx.AsyncClient(
+                timeout=180,
+                trust_env=False,
+            ) as client:
                 response = await client.post(
                     f"{settings.ollama_url}/api/chat",
                     json=payload,
@@ -167,7 +176,10 @@ class ProviderManager:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=180) as client:
+            async with httpx.AsyncClient(
+                timeout=180,
+                trust_env=False,
+            ) as client:
                 async with client.stream(
                     "POST",
                     f"{settings.ollama_url}/api/chat",

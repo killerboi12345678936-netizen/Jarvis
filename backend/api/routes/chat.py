@@ -1,5 +1,6 @@
 
 import json
+import logging
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException
@@ -21,8 +22,12 @@ from backend.providers.manager import (
     provider_manager,
     ProviderError,
 )
+from backend.tools.parser import ToolStreamFilter, build_tool_prompt
+from backend.tools.service import process_tool_calls
 
 router = APIRouter(prefix="/api/chat", tags=["Chat"])
+
+logger = logging.getLogger(__name__)
 
 
 class ChatRequest(BaseModel):
@@ -89,6 +94,11 @@ async def prepare_chat(request: ChatRequest):
     if memory_block:
         system_prompt = f"{system_prompt}\n\n{memory_block}"
 
+    if settings.tools_enabled:
+        system_prompt = (
+            f"{system_prompt}\n\n{build_tool_prompt()}"
+        )
+
     messages = [
         {
             "role": "system",
@@ -124,24 +134,66 @@ async def chat(request: ChatRequest):
             request
         )
 
-        answer = await provider_manager.ask(
-            messages=messages,
-            provider=provider,
-            model=model,
-        )
+        full_response = ""
+        pending_actions = []
+        tool_results = []
 
-        await save_message(
-            session_id,
-            "assistant",
-            provider,
-            answer,
-        )
+        round_messages = list(messages)
+
+        for _ in range(max(1, settings.tool_max_rounds)):
+            answer = await provider_manager.ask(
+                messages=round_messages,
+                provider=provider,
+                model=model,
+            )
+
+            stream_filter = ToolStreamFilter()
+            visible = stream_filter.feed(answer) + stream_filter.finish()
+
+            full_response += visible
+
+            if not stream_filter.tool_calls:
+                break
+
+            follow_up_parts = []
+
+            parts, actions, results = await process_tool_calls(
+                stream_filter.tool_calls,
+            )
+
+            follow_up_parts.extend(parts)
+            pending_actions.extend(actions)
+            tool_results.extend(results)
+
+            if pending_actions or not follow_up_parts:
+                break
+
+            round_messages.append({
+                "role": "assistant",
+                "content": answer,
+            })
+
+            round_messages.append({
+                "role": "user",
+                "content": (
+                    "\n".join(follow_up_parts)
+                    + "\nUse the results above to continue your answer."
+                ),
+            })
+
+        if full_response.strip():
+            await save_message(
+                session_id,
+                "assistant",
+                provider,
+                full_response.strip(),
+            )
 
         return ChatResponse(
             session_id=session_id,
             provider=provider,
             model=model,
-            response=answer,
+            response=full_response.strip(),
         )
 
     except ProviderError as error:
@@ -149,6 +201,20 @@ async def chat(request: ChatRequest):
             status_code=502,
             detail=str(error),
         ) from error
+
+
+def _tool_action_note(pending_actions):
+    if not pending_actions:
+        return ""
+
+    names = ", ".join(
+        action["tool"] for action in pending_actions
+    )
+
+    return (
+        f"\n\n[Action proposed: {names} - "
+        "approve or reject it in the Actions panel.]"
+    )
 
 
 @router.post("/stream")
@@ -167,6 +233,8 @@ async def chat_stream(request: ChatRequest):
 
     async def generate():
         full_response = ""
+        pending_actions = []
+        tool_results = []
 
         yield stream_event(
             "start",
@@ -176,27 +244,77 @@ async def chat_stream(request: ChatRequest):
         )
 
         try:
-            async for chunk in provider_manager.stream(
-                messages=messages,
-                provider=provider,
-                model=model,
-            ):
-                if not chunk:
-                    continue
+            round_messages = list(messages)
 
-                full_response += chunk
+            for _ in range(max(1, settings.tool_max_rounds)):
+                stream_filter = ToolStreamFilter()
+                round_text = ""
 
-                yield stream_event(
-                    "chunk",
-                    text=chunk,
+                async for chunk in provider_manager.stream(
+                    messages=round_messages,
+                    provider=provider,
+                    model=model,
+                ):
+                    if not chunk:
+                        continue
+
+                    round_text += chunk
+
+                    visible = stream_filter.feed(chunk)
+
+                    if visible:
+                        full_response += visible
+
+                        yield stream_event(
+                            "chunk",
+                            text=visible,
+                        )
+
+                tail = stream_filter.finish()
+
+                if tail:
+                    full_response += tail
+
+                    yield stream_event(
+                        "chunk",
+                        text=tail,
+                    )
+
+                if not stream_filter.tool_calls:
+                    break
+
+                follow_up_parts, actions, results = (
+                    await process_tool_calls(stream_filter.tool_calls)
                 )
 
-            if full_response:
+                pending_actions.extend(actions)
+                tool_results.extend(results)
+
+                if pending_actions or not follow_up_parts:
+                    break
+
+                round_messages.append({
+                    "role": "assistant",
+                    "content": round_text,
+                })
+
+                round_messages.append({
+                    "role": "user",
+                    "content": (
+                        "\n".join(follow_up_parts)
+                        + "\nUse the results above to continue "
+                        "your answer."
+                    ),
+                })
+
+            cleaned = full_response.strip()
+
+            if cleaned:
                 await save_message(
                     session_id,
                     "assistant",
                     provider,
-                    full_response,
+                    cleaned,
                 )
 
             yield stream_event(
@@ -204,7 +322,9 @@ async def chat_stream(request: ChatRequest):
                 session_id=session_id,
                 provider=provider,
                 model=model,
-                response=full_response,
+                response=cleaned + _tool_action_note(pending_actions),
+                pending_actions=pending_actions,
+                tool_results=tool_results,
             )
 
         except ProviderError as error:
@@ -214,6 +334,8 @@ async def chat_stream(request: ChatRequest):
             )
 
         except Exception:
+            logger.exception("Chat stream error")
+
             yield stream_event(
                 "error",
                 message="An unexpected error occurred while generating the response.",
