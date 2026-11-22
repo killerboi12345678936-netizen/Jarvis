@@ -55,7 +55,7 @@ class Settings:
 
     # ---- Tools ----
     tools_enabled = os.getenv("TOOLS_ENABLED", "1") == "1"
-    tool_max_rounds = int(os.getenv("TOOL_MAX_ROUNDS", "2"))
+    tool_max_rounds = int(os.getenv("TOOL_MAX_ROUNDS", "3"))
 
     # ---- Voice ----
     whisper_model = os.getenv("WHISPER_MODEL", "base")
@@ -94,6 +94,12 @@ class Settings:
             "notepad=notepad,calculator=calc,paint=mspaint",
         )
     )
+
+    # ---- Device auth (LAN/phone access) ----
+    # All /api endpoints and WebSockets require the shared device
+    # token (data/device_token.txt). Set JARVIS_DEVICE_AUTH=0 only
+    # for automated test runs; never in normal use.
+    device_auth_enabled = os.getenv("JARVIS_DEVICE_AUTH", "1") == "1"
 
 
 settings = Settings()

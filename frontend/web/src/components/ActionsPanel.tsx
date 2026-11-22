@@ -25,6 +25,59 @@ const STATUS_FILTERS = [
   "failed",
 ] as const;
 
+const describeArguments = (action: ToolAction): string => {
+  try {
+    const args = JSON.parse(action.arguments) as Record<
+      string,
+      unknown
+    >;
+
+    if (action.tool_name === "create_note") {
+      return `Create file "${String(args.filename ?? "?")}" with content: ${String(args.content ?? "")}`;
+    }
+
+    if (action.tool_name === "open_application") {
+      return `Open application "${String(args.name ?? "?")}"`;
+    }
+
+    if (action.tool_name === "create_event") {
+      return `Calendar event "${String(args.title ?? "?")}" from ${String(args.start ?? "?")} to ${String(args.end ?? "?")}`;
+    }
+
+    if (action.tool_name === "delete_event") {
+      return `Delete event #${String(args.event_id ?? "?")}`;
+    }
+
+    return JSON.stringify(args, null, 2);
+  } catch {
+    return action.arguments;
+  }
+};
+
+const describeResult = (action: ToolAction): string | null => {
+  if (!action.result) return null;
+
+  if (action.status === "failed") {
+    return `Failed: ${action.result}`;
+  }
+
+  if (action.status === "rejected") {
+    return "Rejected - nothing was changed.";
+  }
+
+  try {
+    const data = JSON.parse(action.result) as Record<string, unknown>;
+
+    if (action.tool_name === "create_note" && data.location) {
+      return `File created and verified: ${String(data.location)}`;
+    }
+
+    return JSON.stringify(data, null, 2);
+  } catch {
+    return action.result;
+  }
+};
+
 export function ActionsPanel({ onClose, onChanged }: ActionsPanelProps) {
   const [actions, setActions] = useState<ToolAction[]>([]);
   const [filter, setFilter] = useState<(typeof STATUS_FILTERS)[number] | "all">("pending");
@@ -123,18 +176,6 @@ export function ActionsPanel({ onClose, onChanged }: ActionsPanelProps) {
           </p>
         ) : (
           actions.map((action) => {
-            let argumentsPreview = "";
-
-            try {
-              argumentsPreview = JSON.stringify(
-                JSON.parse(action.arguments),
-                null,
-                2,
-              );
-            } catch {
-              argumentsPreview = action.arguments;
-            }
-
             return (
               <div className="action-card" key={action.id}>
                 <div className="action-head">
@@ -147,12 +188,14 @@ export function ActionsPanel({ onClose, onChanged }: ActionsPanelProps) {
                   </span>
                 </div>
 
-                <pre className="action-arguments">
-                  {argumentsPreview}
-                </pre>
+                <p className="action-summary">
+                  {describeArguments(action)}
+                </p>
 
-                {action.result && (
-                  <pre className="action-result">{action.result}</pre>
+                {describeResult(action) && (
+                  <p className="action-summary result">
+                    {describeResult(action)}
+                  </p>
                 )}
 
                 {action.status === "pending" && (

@@ -391,12 +391,46 @@
 }
 
 @media (max-width: 760px) {
+  /* The sidebar becomes a slide-in drawer behind a backdrop instead
+     of disappearing entirely. */
+  .app-shell {
+    height: 100dvh;
+    overflow: hidden;
+  }
+
   .sidebar {
-    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    z-index: 60;
+    width: 262px;
+    min-width: 262px;
+    transform: translateX(-105%);
+    transition: transform 0.24s ease;
+    overflow-y: auto;
+    box-shadow: 18px 0 40px rgba(0, 0, 0, 0.45);
+  }
+
+  .app-shell.sidebar-open .sidebar {
+    transform: translateX(0);
+  }
+
+  .sidebar-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 55;
+    background: rgba(4, 7, 12, 0.62);
+    animation: slideover-in 0.18s ease;
+  }
+
+  .main-panel {
+    height: 100dvh;
+    min-height: 0;
   }
 
   .topbar {
-    padding: 0 17px;
+    padding: 0 14px;
   }
 
   .mobile-menu {
@@ -1655,5 +1689,235 @@ button:disabled {
 @media (max-width: 1100px) {
   .toolbar-hint {
     display: none;
+  }
+}
+/* =========================================
+   DEVICE PAIRING GATE
+========================================= */
+
+.pair-gate {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  background: #080b12;
+  padding: 20px;
+}
+
+.pair-card {
+  width: min(420px, 100%);
+  padding: 30px 26px;
+  background: #0c1019;
+  border: 1px solid #1f2a3a;
+  border-radius: 16px;
+  text-align: center;
+}
+
+.pair-icon {
+  width: 56px;
+  height: 56px;
+  margin: 0 auto 16px;
+  display: grid;
+  place-items: center;
+  color: #7ddcff;
+  background: #142a39;
+  border: 1px solid #28506a;
+  border-radius: 14px;
+}
+
+.pair-card h1 {
+  font: 700 19px 'Space Grotesk', sans-serif;
+  color: #dce7f2;
+  margin: 0 0 10px;
+}
+
+.pair-card p {
+  color: #7f90a5;
+  font-size: 12.5px;
+  line-height: 1.65;
+  margin: 0 0 18px;
+  overflow-wrap: anywhere;
+}
+
+.pair-card code {
+  color: #9ce5ff;
+  font-size: 11px;
+}
+
+.pair-input-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 14px;
+  min-height: 48px;
+  background: #101722;
+  border: 1px solid #29384a;
+  border-radius: 10px;
+  color: #63748a;
+  margin-bottom: 14px;
+}
+
+.pair-input-row input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: #dce7f2;
+  font-size: 15px;
+  letter-spacing: 1px;
+}
+
+.pair-error {
+  color: #ff9d9d;
+  font-size: 12px;
+  margin: -6px 0 14px;
+}
+
+/* =========================================
+   INLINE ACTION CARDS (CHAT)
+========================================= */
+
+.action-card-inline {
+  margin-top: 10px;
+  padding: 12px 14px;
+  background: #0e1520;
+  border: 1px solid #2a3a4e;
+  border-radius: 10px;
+}
+
+.action-card-inline.approved {
+  border-color: #2c5e3d;
+}
+
+.action-card-inline.failed {
+  border-color: #5e2c34;
+}
+
+.action-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.action-card-head svg {
+  color: #9ce5ff;
+}
+
+.action-card-tool {
+  color: #a2b3c6;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+}
+
+.action-card-head .action-status {
+  margin-left: auto;
+}
+
+.action-card-summary {
+  margin: 9px 0 0;
+  color: #dce7f2;
+  font-size: 13px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.action-card-result {
+  margin: 9px 0 0;
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.action-card-result.ok {
+  color: #7fe0a8;
+}
+
+.action-card-result.error {
+  color: #ff9d9d;
+}
+
+.action-card-inline .action-buttons {
+  margin-top: 11px;
+}
+
+/* =========================================
+   READABLE ACTION SUMMARIES (ACTIONS PANEL)
+========================================= */
+
+.action-summary {
+  margin: 0 0 9px;
+  padding: 9px 11px;
+  color: #c3d1e0;
+  background: #0a0f17;
+  border: 1px solid #1b2534;
+  border-radius: 7px;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.action-summary.result {
+  color: #7fe0a8;
+}
+
+/* =========================================
+   MOBILE TOUCH REFINEMENTS
+========================================= */
+
+@media (max-width: 760px) {
+  /* 16px input text prevents iOS Safari from auto-zooming the page. */
+  .composer input {
+    font-size: 16px;
+  }
+
+  .send-button,
+  .mic-button {
+    width: 44px;
+    height: 44px;
+  }
+
+  .composer {
+    min-height: 56px;
+  }
+
+  /* Lift the composer above the on-screen keyboard (iOS). */
+  .composer-area {
+    margin-bottom: calc(14px + var(--kb-height, 0px));
+    width: calc(100% - 20px);
+  }
+
+  .chat-area {
+    padding: 18px 12px;
+  }
+
+  .message-content p {
+    font-size: 14.5px;
+  }
+
+  .topbar h2 {
+    font-size: 12px;
+  }
+
+  .voice-primary-button,
+  .voice-toggle,
+  .voice-danger-button,
+  .action-approve,
+  .action-reject {
+    min-height: 44px;
+  }
+
+  .sidebar-item,
+  .new-chat {
+    min-height: 46px;
+  }
+
+  .session-item {
+    min-height: 48px;
+  }
+
+  .slideover {
+    width: 100%;
+    border-left: none;
   }
 }

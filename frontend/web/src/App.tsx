@@ -2,7 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Menu, Search } from "lucide-react";
 import "./App.css";
 
-import { apiGet, API, fetchTtsAudio } from "./lib/api";
+import {
+  apiGet,
+  API,
+  ApiError,
+  fetchTtsAudio,
+  getDeviceToken,
+} from "./lib/api";
 import {
   extractCompleteSentences,
 } from "./lib/segmentation";
@@ -10,7 +16,12 @@ import type { VoiceTuning } from "./lib/voiceClient";
 
 import { Composer } from "./components/Composer";
 import { LiveVoicePanel } from "./components/LiveVoicePanel";
-import { MessageList, type Message } from "./components/MessageList";
+import {
+  MessageList,
+  type Message,
+  type ProposedAction,
+} from "./components/MessageList";
+import { PairGate } from "./components/PairGate";
 import { ProviderToolbar } from "./components/ProviderToolbar";
 import { Sidebar, type PanelId, type SessionSummary } from "./components/Sidebar";
 import { MemoryPanel } from "./components/MemoryPanel";
@@ -37,12 +48,20 @@ type StreamEvent = {
   text?: string;
   response?: string;
   message?: string;
+  pending_actions?: {
+    action_id: number;
+    tool: string;
+    arguments: Record<string, unknown>;
+    description: string;
+  }[];
 };
 
 type StoredMessage = {
   role: string;
   content: string;
 };
+
+type AuthState = "checking" | "paired" | "unpaired";
 
 function App() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -65,6 +84,8 @@ function App() {
   const [activePanel, setActivePanel] = useState<PanelId | null>(null);
   const [liveVoiceOpen, setLiveVoiceOpen] = useState(false);
   const [pendingActions, setPendingActions] = useState(0);
+  const [authState, setAuthState] = useState<AuthState>("checking");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [tuning, setTuning] = useState<VoiceTuning>({
     continuous: true,
     speechThreshold: 0.015,
@@ -203,7 +224,12 @@ function App() {
 
       setConnected(true);
       setStatus("Jarvis online");
-    } catch {
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        setAuthState("unpaired");
+        return;
+      }
+
       setConnected(false);
       setStatus("Backend offline");
     }
@@ -254,23 +280,84 @@ function App() {
     }
   }, []);
 
+  // Check the stored device token once on startup, then only talk to
+  // the backend after pairing succeeded.
   useEffect(() => {
-    void loadProviders();
-  }, [loadProviders]);
-
-  useEffect(() => {
-    if (connected) {
-      void loadModels();
-      void loadSessions();
-      void loadPendingActions();
+    if (!getDeviceToken()) {
+      setAuthState("unpaired");
+      return;
     }
-  }, [connected, loadModels, loadSessions, loadPendingActions]);
+
+    apiGet("/api/auth/status")
+      .then(() => setAuthState("paired"))
+      .catch((error) => {
+        setAuthState(
+          error instanceof ApiError && error.status === 401
+            ? "unpaired"
+            : "unpaired",
+        );
+      });
+  }, []);
 
   useEffect(() => {
+    if (authState !== "paired") return;
+
+    void loadProviders();
+  }, [authState, loadProviders]);
+
+  // Keep retrying while the backend is down so a late-starting
+  // server connects without a manual refresh.
+  useEffect(() => {
+    if (authState !== "paired" || connected) return;
+
+    const interval = setInterval(() => void loadProviders(), 5000);
+
+    return () => clearInterval(interval);
+  }, [authState, connected, loadProviders]);
+
+  useEffect(() => {
+    if (authState !== "paired" || !connected) return;
+
+    void loadModels();
+    void loadSessions();
+    void loadPendingActions();
+  }, [authState, connected, loadModels, loadSessions, loadPendingActions]);
+
+  useEffect(() => {
+    if (authState !== "paired") return;
+
     const interval = setInterval(() => void loadPendingActions(), 10000);
 
     return () => clearInterval(interval);
-  }, [loadPendingActions]);
+  }, [authState, loadPendingActions]);
+
+  // Keep the composer visible when the on-screen keyboard opens
+  // (iOS Safari resizes via visualViewport instead of the layout
+  // viewport).
+  useEffect(() => {
+    const viewport = window.visualViewport;
+
+    if (!viewport) return;
+
+    const syncKeyboard = () => {
+      const keyboard =
+        Math.max(0, window.innerHeight - viewport.height) +
+        viewport.offsetTop;
+
+      document.documentElement.style.setProperty(
+        "--kb-height",
+        `${keyboard}px`,
+      );
+    };
+
+    viewport.addEventListener("resize", syncKeyboard);
+    viewport.addEventListener("scroll", syncKeyboard);
+
+    return () => {
+      viewport.removeEventListener("resize", syncKeyboard);
+      viewport.removeEventListener("scroll", syncKeyboard);
+    };
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -385,6 +472,9 @@ function App() {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
+            ...(getDeviceToken()
+              ? { "X-Device-Token": getDeviceToken() }
+              : {}),
           },
           body: JSON.stringify({
             message,
@@ -480,7 +570,12 @@ function App() {
           completed = true;
 
           if (typeof event.response === "string") {
-            fullResponse = event.response;
+            // The backend appends an "[Action proposed...]" note to the
+            // persisted text; the interactive card below replaces it.
+            fullResponse = event.response.replace(
+              /\s*\[Action proposed and awaiting your approval[^\]]*\]\s*$/,
+              "",
+            );
 
             setMessages((previous) => {
               const updated = [...previous];
@@ -490,11 +585,22 @@ function App() {
                 updated[lastIndex] = {
                   ...updated[lastIndex],
                   content: fullResponse,
+                  actions: (event.pending_actions ?? []).map(
+                    (action) => ({
+                      ...action,
+                      status: "pending" as const,
+                      result: null,
+                    }),
+                  ),
                 };
               }
 
               return updated;
             });
+
+            if (event.pending_actions?.length) {
+              void loadPendingActions();
+            }
           }
 
           setStatus(`Online · ${event.provider} · ${event.model}`);
@@ -622,6 +728,9 @@ function App() {
 
           const response = await fetch(`${API}/api/voice/transcribe`, {
             method: "POST",
+            headers: getDeviceToken()
+              ? { "X-Device-Token": getDeviceToken() }
+              : undefined,
             body: formData,
           });
 
@@ -720,6 +829,32 @@ function App() {
     void loadSessions();
   };
 
+  const handleActionUpdate = (
+    messageIndex: number,
+    actionId: number,
+    patch: Partial<ProposedAction>,
+  ) => {
+    setMessages((previous) => {
+      const updated = [...previous];
+      const message = updated[messageIndex];
+
+      if (message?.role !== "assistant" || !message.actions) {
+        return updated;
+      }
+
+      updated[messageIndex] = {
+        ...message,
+        actions: message.actions.map((action) =>
+          action.action_id === actionId
+            ? { ...action, ...patch }
+            : action,
+        ),
+      };
+
+      return updated;
+    });
+  };
+
   const handleProviderChange = (nextProvider: string) => {
     setProvider(nextProvider);
 
@@ -728,23 +863,57 @@ function App() {
     }
   };
 
+  if (authState === "checking") {
+    return (
+      <div className="pair-gate">
+        <div className="pair-card">
+          <p>Connecting to Jarvis...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (authState === "unpaired") {
+    return <PairGate onPaired={() => setAuthState("paired")} />;
+  }
+
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${sidebarOpen ? "sidebar-open" : ""}`}>
+      {sidebarOpen && (
+        <div
+          className="sidebar-backdrop"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
+
       <Sidebar
         connected={connected}
         sessionId={sessionId}
         sessions={sessions}
         activeSessionId={activeSessionId}
         pendingActions={pendingActions}
-        onNewConversation={newConversation}
-        onOpenPanel={(panel) => setActivePanel(panel)}
-        onSelectSession={(id) => void selectSession(id)}
+        onNewConversation={() => {
+          newConversation();
+          setSidebarOpen(false);
+        }}
+        onOpenPanel={(panel) => {
+          setActivePanel(panel);
+          setSidebarOpen(false);
+        }}
+        onSelectSession={(id) => {
+          void selectSession(id);
+          setSidebarOpen(false);
+        }}
       />
 
       <main className="main-panel">
         <header className="topbar">
           <div className="topbar-left">
-            <button className="icon-button mobile-menu">
+            <button
+              className="icon-button mobile-menu"
+              title="Menu"
+              onClick={() => setSidebarOpen((value) => !value)}
+            >
               <Menu size={20} />
             </button>
             <div>
@@ -793,6 +962,8 @@ function App() {
             messages={messages}
             loading={loading}
             onSpeak={(text) => void speak(text)}
+            onActionUpdate={handleActionUpdate}
+            onActionsChanged={() => void loadPendingActions()}
           />
         </section>
 
