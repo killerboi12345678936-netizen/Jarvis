@@ -1,4 +1,5 @@
 
+import ast
 import json
 import re
 
@@ -11,14 +12,163 @@ TOOL_OPEN = "<<TOOL:"
 
 TOOL_CLOSE = ">>"
 
+# Bare Python-style literals after a colon (models emit
+# "arguments": none instead of null). Only applied when strict JSON
+# parsing fails; the quote at the start of a string value prevents
+# matches inside quoted text.
+BARE_LITERAL_RE = re.compile(r"(:\s*)(none|None|True|False)\b")
+
+HTML_BREAK_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+
+# Real proposal notes are appended by the backend after the model
+# finishes. If this text shows up in the model's OWN output, no tool
+# call was emitted and the model fabricated the note by copying chat
+# history (small models do this).
+FAKE_PROPOSAL_RE = re.compile(
+    r"\s*\[Action proposed[^\]]*\]"
+    r"(?:\s*\.?\s*Open the Actions panel[^.]*\.?)?"
+)
+
+TOOL_CALL_CORRECTION = (
+    "Your previous reply said an action was proposed, but you did "
+    "not actually emit a tool call. If the user's request requires "
+    "a tool, emit the call now in the exact format "
+    '<<TOOL:{"name": "tool_name", "arguments": {}}>> on its own '
+    "line, then stop. Do not describe or imitate proposal notes. If "
+    "no tool is needed, answer normally."
+)
+
+MALFORMED_CALL_CORRECTION = (
+    "Your previous reply contained a tool call that could not be "
+    "parsed. Emit the call again, exactly in the format "
+    '<<TOOL:{"name": "tool_name", "arguments": {}}>> on its own '
+    "line, with valid JSON and no extra text or HTML on that line. "
+    "Use {} for the arguments when the tool needs none. If no tool "
+    "is needed, just answer normally."
+)
+
+
+def normalize_visible_text(text):
+    """Model output sometimes contains HTML line-break tags that the
+    chat UI would display literally; convert them to real newlines."""
+    return HTML_BREAK_RE.sub("\n", text)
+
+
+def strip_fake_proposals(text):
+    """Remove proposal notes the model fabricated instead of emitting
+    a real tool call."""
+    return FAKE_PROPOSAL_RE.sub("", text)
+
+
+def _jsonify_literal(match):
+    word = match.group(2)
+
+    if word.lower() == "none":
+        return match.group(1) + "null"
+
+    return match.group(1) + word.lower()
+
+
+def _try_json_loads(text):
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _try_literal_eval(text):
+    """Last resort for Python-style bodies such as
+    {'name': 'get_time', 'arguments': {}}. ast.literal_eval never
+    executes code, so model output is safe to evaluate."""
+
+    if not text.startswith("{"):
+        return None
+
+    try:
+        data = ast.literal_eval(text)
+    except (ValueError, SyntaxError, TypeError, MemoryError):
+        return None
+
+    return data if isinstance(data, dict) else None
+
+
+def parse_tool_json(text):
+    """Parse a tool-call body, tolerating the malformed variants small
+    models emit: a stray extra closing brace before >>, bare Python
+    literals (none/None/True/False instead of JSON null/true/false),
+    and Python dict syntax with single quotes."""
+
+    stripped = text.strip()
+
+    candidates = [stripped]
+
+    if (
+        stripped.endswith("}")
+        and stripped.count("{") < stripped.count("}")
+    ):
+        candidates.append(stripped[:-1])
+
+    for candidate in candidates:
+        data = _try_json_loads(candidate)
+
+        if data is not None:
+            return data
+
+        data = _try_json_loads(
+            BARE_LITERAL_RE.sub(_jsonify_literal, candidate)
+        )
+
+        if data is not None:
+            return data
+
+        data = _try_literal_eval(candidate)
+
+        if data is not None:
+            return data
+
+    return None
+
+
+def normalize_tool_name(value):
+    if not isinstance(value, str):
+        return None
+
+    name = value.strip().lower()
+
+    return name or None
+
+
+def normalize_arguments(value):
+    """Missing, null-like or non-object argument payloads become an
+    empty dict; each tool then validates its own required arguments
+    and produces a clear error the model can retry from."""
+
+    if isinstance(value, dict):
+        return value
+
+    if isinstance(value, str) and value.strip().lower() in (
+        "",
+        "none",
+        "null",
+        "{}",
+    ):
+        return {}
+
+    return {}
+
 
 class ToolStreamFilter:
     """Extracts <<TOOL:{...}>> blocks from streamed model output.
 
-    Small models sometimes emit single-bracket markers (<TOOL:{...}>)
-    or a bare tool name (<<TOOL:get_time>>), so the parser accepts
-    those variants. Text safe to display or speak is returned from
-    feed()/finish(); complete tool calls are collected in tool_calls.
+    Small models emit many variants (single-bracket markers,
+    bare tool names, Python-style arguments, "arguments": none, a
+    stray <br> after the call); the parser salvages them all. Bodies
+    that cannot be salvaged are held out of the visible text and
+    collected in invalid_blocks so the chat loop can give the model
+    a corrective round instead of showing raw markup to the user.
+    Tool names are not validated here: unknown names are still
+    registered (and hidden) so the dispatcher can report them back
+    to the model for a retry.
     """
 
     def __init__(self):
@@ -72,20 +222,24 @@ class ToolStreamFilter:
 
             if close is None:
                 if final:
-                    emitted.append(self.buffer)
+                    # The model may end its turn without ever closing
+                    # the marker; salvage the call when the body is
+                    # otherwise complete.
+                    candidate = self.buffer[body_start:]
+
+                    if not self._register(candidate):
+                        self.invalid_blocks.append(candidate)
+
                     self.buffer = ""
                 else:
                     self.buffer = self.buffer[opener.start():]
 
                 break
 
-            raw_block = self.buffer[opener.start():close + 1]
-
             body = self.buffer[body_start:close]
 
             if not self._register(body):
                 self.invalid_blocks.append(body)
-                emitted.append(raw_block)
 
             close_length = (
                 2
@@ -141,12 +295,8 @@ class ToolStreamFilter:
         for position in sorted(positions):
             candidate = self.buffer[body_start:position]
 
-            try:
-                json.loads(candidate.strip())
-            except (json.JSONDecodeError, ValueError):
-                continue
-
-            return position
+            if parse_tool_json(candidate) is not None:
+                return position
 
         if final and positions:
             return min(positions)
@@ -154,18 +304,16 @@ class ToolStreamFilter:
         return None
 
     def _register(self, block):
-        try:
-            data = json.loads(block.strip())
+        data = parse_tool_json(block)
 
-            name = data.get("name")
-            arguments = data.get("arguments", {})
+        if isinstance(data, dict):
+            name = normalize_tool_name(data.get("name"))
 
-            if isinstance(name, str) and isinstance(arguments, dict):
-                self.tool_calls.append((name, arguments))
+            if name:
+                self.tool_calls.append(
+                    (name, normalize_arguments(data.get("arguments")))
+                )
                 return True
-
-        except (json.JSONDecodeError, ValueError):
-            pass
 
         bare_name = block.strip().lower()
 
@@ -182,8 +330,20 @@ def build_tool_prompt():
         "format on its own line (and nothing else on that line):",
         '<<TOOL:{"name": "tool_name", "arguments": {"arg": "value"}}>>',
         "Use double angle brackets << >> exactly as shown.",
+        "If a tool takes no arguments, pass an empty object {} exactly:",
+        '<<TOOL:{"name": "tool_name", "arguments": {}}>>.',
+        "Never write none or null for the arguments and never omit the",
+        "arguments field. Never wrap a tool call in HTML such as <br>.",
+        "You may emit several tool calls, each on its own line.",
         "Only use tools from the list below. After emitting a tool call,",
         "stop and wait for the result. Do not invent tools or results.",
+        "",
+        "Arguments must match the user's request EXACTLY. Use the same",
+        "filename, spelling, capitalization and text the user gave;",
+        "never rename, translate, shorten or rephrase requested names",
+        "or content. If the user asks for 'Jarvis.txt' use 'Jarvis.txt'.",
+        "When a tool needs approval, just emit the call; the system",
+        "shows the proposal to the user.",
         "",
         "Available tools:",
     ]

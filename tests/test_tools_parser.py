@@ -51,12 +51,14 @@ def test_bare_tool_name_marker():
     assert stream_filter.tool_calls == [("get_time", {})]
 
 
-def test_invalid_json_block_kept_visible():
+def test_invalid_json_block_hidden_and_collected():
+    # Unparseable markup must never reach the user; the chat loop
+    # uses invalid_blocks to give the model a corrective round.
     text = 'Before <<TOOL:not_json_at_all>> after'
 
     visible, stream_filter = feed_all(text)
 
-    assert "not_json_at_all" in visible
+    assert visible == "Before  after"
     assert stream_filter.tool_calls == []
     assert stream_filter.invalid_blocks == ["not_json_at_all"]
 
@@ -75,11 +77,26 @@ def test_json_with_inner_gt_character():
     ]
 
 
-def test_unknown_tool_name_not_registered():
+def test_unknown_bare_word_hidden_and_collected():
+    # A bare word that is neither JSON nor a registered zero-argument
+    # tool is unparseable; it stays hidden and triggers a corrective
+    # round via invalid_blocks.
     _, stream_filter = feed_all("<<TOOL:destroy_everything>>")
 
     assert stream_filter.tool_calls == []
     assert stream_filter.invalid_blocks == ["destroy_everything"]
+
+
+def test_unknown_name_in_valid_json_registered_for_feedback():
+    # Valid JSON with an unregistered name is still registered and
+    # hidden; the dispatcher reports the unknown name back to the
+    # model so it can retry with a real tool.
+    _, stream_filter = feed_all(
+        '<<TOOL:{"name": "time_machine", "arguments": {}}>>'
+    )
+
+    assert stream_filter.tool_calls == [("time_machine", {})]
+    assert stream_filter.invalid_blocks == []
 
 
 def test_text_without_markers_passes_through():
@@ -103,6 +120,50 @@ def test_multiple_tool_calls():
         ("get_time", {}),
         ("system_info", {}),
     ]
+
+
+def test_extra_closing_brace_is_tolerated():
+    text = '<<TOOL:{"name": "get_time", "arguments": {}}}>>'
+
+    visible, stream_filter = feed_all(text)
+
+    assert visible == ""
+    assert stream_filter.tool_calls == [("get_time", {})]
+    assert stream_filter.invalid_blocks == []
+
+    for chunk_size in range(1, 12):
+        visible, stream_filter = feed_all(text, chunk_size)
+
+        assert visible == "", chunk_size
+        assert stream_filter.tool_calls == [("get_time", {})], chunk_size
+
+
+def test_single_bracket_with_extra_brace():
+    text = '<TOOL:{"name": "get_time", "arguments": {}}}>'
+
+    visible, stream_filter = feed_all(text)
+
+    assert visible == ""
+    assert stream_filter.tool_calls == [("get_time", {})]
+
+
+def test_unterminated_marker_with_complete_body_is_salvaged():
+    text = 'Hi <<TOOL:{"name": "get_time", "arguments": {}}}'
+
+    for chunk_size in (3, 7, 40):
+        visible, stream_filter = feed_all(text, chunk_size)
+
+        assert visible.strip() == "Hi", chunk_size
+        assert stream_filter.tool_calls == [("get_time", {})], chunk_size
+
+
+def test_unterminated_marker_with_garbage_stays_visible():
+    visible, stream_filter = feed_all(
+        'Answer <<TOOL:{"name": "get_ti',
+    )
+
+    assert visible.startswith("Answer ")
+    assert stream_filter.tool_calls == []
 
 
 def test_unterminated_marker_at_stream_end():

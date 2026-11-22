@@ -2,7 +2,7 @@
 import json
 
 from backend.tools.permissions import propose_action
-from backend.tools.registry import get_tool, run_tool
+from backend.tools.registry import TOOLS, get_tool, run_tool
 
 
 async def process_tool_calls(tool_calls):
@@ -19,11 +19,24 @@ async def process_tool_calls(tool_calls):
         tool = get_tool(name)
 
         if not tool:
+            error = (
+                f"Unknown tool '{name}'. "
+                f"Valid tools: {', '.join(sorted(TOOLS))}."
+            )
+
             tool_results.append({
                 "tool": name,
                 "arguments": arguments,
-                "error": "Unknown tool.",
+                "error": error,
             })
+
+            # Report the failure back to the model so it can retry
+            # with a registered tool; without a follow-up part the
+            # turn would end silently.
+            follow_up_parts.append(
+                f"TOOL_RESULT {name}: failed - {error}"
+            )
+
             continue
 
         if tool["permission"] == "automatic":

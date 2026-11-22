@@ -62,14 +62,36 @@ def create_note(arguments):
     path = _resolve_workspace_file(filename, extensions=(".txt",))
 
     if path.exists():
-        raise ValueError("A note with this filename already exists.")
+        raise ValueError(
+            f"A file named '{path.name}' already exists in the "
+            "workspace. Jarvis never overwrites files; ask to delete "
+            "it first or choose another filename."
+        )
 
     path.write_text(content, encoding="utf-8")
 
+    # Confirm success only after verifying the file exists on disk and
+    # its contents match what was requested.
+    if not path.is_file():
+        raise OSError(
+            f"File '{path.name}' reported as written but was not found "
+            "on disk."
+        )
+
+    written = path.read_text(encoding="utf-8")
+
+    if written != content:
+        raise OSError(
+            f"Verification failed: contents of '{path.name}' do not "
+            "match the requested text."
+        )
+
     return {
         "created": True,
-        "filename": filename,
+        "verified": True,
+        "filename": path.name,
         "location": str(path),
+        "bytes": len(content.encode("utf-8")),
     }
 
 
@@ -225,6 +247,27 @@ async def delete_event(arguments):
     }
 
 
+async def telegram_digest(arguments):
+    from backend.integrations.telegram.digest import build_digest
+
+    try:
+        hours = int(arguments.get("hours", 168))
+    except (TypeError, ValueError):
+        hours = 168
+
+    hours = max(1, min(hours, 336))
+
+    return await build_digest(hours=hours)
+
+
+async def telegram_plan(arguments):
+    from backend.integrations.telegram.report import build_study_report
+
+    report = await build_study_report()
+
+    return {"report": report}
+
+
 TOOLS = {
     "get_time": {
         "description": "Get the computer's current local time.",
@@ -315,6 +358,34 @@ TOOLS = {
         "arguments": {
             "event_id": "numeric id from read_calendar",
         },
+    },
+    "telegram_digest": {
+        "description": (
+            "Read recent messages from the user's Telegram study "
+            "groups (Mathematics, Physics, Chemistry). The groups are "
+            "already configured from .env; NEVER ask the user for "
+            "group names. Strictly read-only: Jarvis never sends "
+            "messages or modifies Telegram. Returns announcements, "
+            "assignments, tests, lecture recordings and deadlines."
+        ),
+        "permission": "automatic",
+        "function": telegram_digest,
+        "arguments": {
+            "hours": "how far back to read, 1-336 hours (default 168)",
+        },
+    },
+    "telegram_plan": {
+        "description": (
+            "Read the Telegram study groups and build a suggested "
+            "daily/weekly study plan from actual announcements, "
+            "assignments and deadlines. Groups are pre-configured; "
+            "never ask the user for group names. Suggestion only: it "
+            "never creates or changes calendar events, and Telegram "
+            "is never written to."
+        ),
+        "permission": "automatic",
+        "function": telegram_plan,
+        "arguments": {},
     },
 }
 

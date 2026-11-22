@@ -18,11 +18,23 @@ from backend.memory.retrieval import (
     find_relevant_memories,
     memory_context_block,
 )
+from backend.integrations.telegram.report import (
+    build_study_report_safe,
+    match_study_intent,
+)
 from backend.providers.manager import (
     provider_manager,
     ProviderError,
 )
-from backend.tools.parser import ToolStreamFilter, build_tool_prompt
+from backend.tools.parser import (
+    ToolStreamFilter,
+    build_tool_prompt,
+    FAKE_PROPOSAL_RE,
+    MALFORMED_CALL_CORRECTION,
+    TOOL_CALL_CORRECTION,
+    normalize_visible_text,
+    strip_fake_proposals,
+)
 from backend.tools.service import process_tool_calls
 
 router = APIRouter(prefix="/api/chat", tags=["Chat"])
@@ -134,9 +146,31 @@ async def chat(request: ChatRequest):
             request
         )
 
+        # Deterministic route: study-group requests go straight to the
+        # Telegram digest/plan workflow instead of hoping the model
+        # picks a tool.
+        if match_study_intent(request.message):
+            report = await build_study_report_safe()
+
+            await save_message(
+                session_id,
+                "assistant",
+                provider,
+                report,
+            )
+
+            return ChatResponse(
+                session_id=session_id,
+                provider=provider,
+                model=model,
+                response=report,
+            )
+
         full_response = ""
         pending_actions = []
         tool_results = []
+        corrected = False
+        corrected_malformed = False
 
         round_messages = list(messages)
 
@@ -153,6 +187,35 @@ async def chat(request: ChatRequest):
             full_response += visible
 
             if not stream_filter.tool_calls:
+                # The model may fake a proposal note instead of
+                # emitting a tool call; give it one explicit retry.
+                if not corrected and FAKE_PROPOSAL_RE.search(visible):
+                    corrected = True
+                    round_messages.append({
+                        "role": "assistant",
+                        "content": answer,
+                    })
+                    round_messages.append({
+                        "role": "user",
+                        "content": TOOL_CALL_CORRECTION,
+                    })
+                    continue
+
+                # The model tried to call a tool but the markup was
+                # unparseable; give it one explicit retry rather than
+                # ending the turn with nothing.
+                if not corrected_malformed and stream_filter.invalid_blocks:
+                    corrected_malformed = True
+                    round_messages.append({
+                        "role": "assistant",
+                        "content": answer,
+                    })
+                    round_messages.append({
+                        "role": "user",
+                        "content": MALFORMED_CALL_CORRECTION,
+                    })
+                    continue
+
                 break
 
             follow_up_parts = []
@@ -181,19 +244,38 @@ async def chat(request: ChatRequest):
                 ),
             })
 
-        if full_response.strip():
+        had_fake = bool(FAKE_PROPOSAL_RE.search(full_response))
+        cleaned = strip_fake_proposals(
+            normalize_visible_text(full_response)
+        ).strip()
+        note = _tool_action_note(pending_actions)
+
+        if corrected and had_fake and not note:
+            cleaned = (
+                cleaned
+                + "\n\n(I could not prepare that action just now. "
+                "Please try again.)"
+            ).strip()
+
+        if corrected_malformed and not cleaned and not note:
+            cleaned = (
+                "(I could not prepare that action just now. "
+                "Please try again.)"
+            )
+
+        if cleaned or note:
             await save_message(
                 session_id,
                 "assistant",
                 provider,
-                full_response.strip(),
+                (cleaned + note).strip(),
             )
 
         return ChatResponse(
             session_id=session_id,
             provider=provider,
             model=model,
-            response=full_response.strip(),
+            response=(cleaned + note).strip(),
         )
 
     except ProviderError as error:
@@ -203,17 +285,48 @@ async def chat(request: ChatRequest):
         ) from error
 
 
+def _describe_action(action):
+    tool = action["tool"]
+    arguments = action["arguments"]
+
+    if tool == "create_note":
+        return (
+            f"create_note: file '{arguments.get('filename', '?')}' "
+            f"with content: {str(arguments.get('content', ''))[:200]}"
+        )
+
+    if tool == "open_application":
+        return f"open_application: {arguments.get('name', '?')}"
+
+    if tool == "create_event":
+        return (
+            f"create_event: '{arguments.get('title', '?')}' "
+            f"from {arguments.get('start', '?')} "
+            f"to {arguments.get('end', '?')}"
+        )
+
+    if tool == "delete_event":
+        return f"delete_event: event_id {arguments.get('event_id', '?')}"
+
+    try:
+        return f"{tool}: {json.dumps(arguments)[:200]}"
+    except (TypeError, ValueError):
+        return tool
+
+
 def _tool_action_note(pending_actions):
     if not pending_actions:
         return ""
 
-    names = ", ".join(
-        action["tool"] for action in pending_actions
-    )
+    lines = [
+        _describe_action(action) for action in pending_actions
+    ]
 
     return (
-        f"\n\n[Action proposed: {names} - "
-        "approve or reject it in the Actions panel.]"
+        "\n\n[Action proposed and awaiting your approval - "
+        + "; ".join(lines)
+        + ". Open the Actions panel (or use the buttons below) to "
+        "approve or reject.]"
     )
 
 
@@ -244,7 +357,36 @@ async def chat_stream(request: ChatRequest):
         )
 
         try:
+            # Deterministic route: study-group requests go straight to
+            # the Telegram digest/plan workflow instead of hoping the
+            # model picks a tool.
+            if match_study_intent(request.message):
+                report = await build_study_report_safe()
+
+                await save_message(
+                    session_id,
+                    "assistant",
+                    provider,
+                    report,
+                )
+
+                yield stream_event("chunk", text=report)
+
+                yield stream_event(
+                    "done",
+                    session_id=session_id,
+                    provider=provider,
+                    model=model,
+                    response=report,
+                    pending_actions=[],
+                    tool_results=[],
+                )
+
+                return
+
             round_messages = list(messages)
+            corrected = False
+            corrected_malformed = False
 
             for _ in range(max(1, settings.tool_max_rounds)):
                 stream_filter = ToolStreamFilter()
@@ -281,6 +423,41 @@ async def chat_stream(request: ChatRequest):
                     )
 
                 if not stream_filter.tool_calls:
+                    # The model may fake a proposal note instead of
+                    # emitting a tool call; give it one explicit
+                    # retry before giving up.
+                    if (
+                        not corrected
+                        and FAKE_PROPOSAL_RE.search(round_text)
+                    ):
+                        corrected = True
+                        round_messages.append({
+                            "role": "assistant",
+                            "content": round_text,
+                        })
+                        round_messages.append({
+                            "role": "user",
+                            "content": TOOL_CALL_CORRECTION,
+                        })
+                        continue
+
+                    # Unparseable tool-call markup: one corrective
+                    # round, then the honest fallback below.
+                    if (
+                        not corrected_malformed
+                        and stream_filter.invalid_blocks
+                    ):
+                        corrected_malformed = True
+                        round_messages.append({
+                            "role": "assistant",
+                            "content": round_text,
+                        })
+                        round_messages.append({
+                            "role": "user",
+                            "content": MALFORMED_CALL_CORRECTION,
+                        })
+                        continue
+
                     break
 
                 follow_up_parts, actions, results = (
@@ -307,14 +484,35 @@ async def chat_stream(request: ChatRequest):
                     ),
                 })
 
-            cleaned = full_response.strip()
+            had_fake = bool(FAKE_PROPOSAL_RE.search(full_response))
+            cleaned = strip_fake_proposals(
+                normalize_visible_text(full_response)
+            ).strip()
 
-            if cleaned:
+            # Persist the proposal so the conversation still shows what
+            # was asked for after a reload; without this, a turn that
+            # only emitted a tool call would vanish from history.
+            note = _tool_action_note(pending_actions)
+
+            if corrected and had_fake and not note:
+                cleaned = (
+                    cleaned
+                    + "\n\n(I could not prepare that action just now. "
+                    "Please try again.)"
+                ).strip()
+
+            if corrected_malformed and not cleaned and not note:
+                cleaned = (
+                    "(I could not prepare that action just now. "
+                    "Please try again.)"
+                )
+
+            if cleaned or note:
                 await save_message(
                     session_id,
                     "assistant",
                     provider,
-                    cleaned,
+                    (cleaned + note).strip(),
                 )
 
             yield stream_event(
@@ -322,7 +520,7 @@ async def chat_stream(request: ChatRequest):
                 session_id=session_id,
                 provider=provider,
                 model=model,
-                response=cleaned + _tool_action_note(pending_actions),
+                response=cleaned + note,
                 pending_actions=pending_actions,
                 tool_results=tool_results,
             )
