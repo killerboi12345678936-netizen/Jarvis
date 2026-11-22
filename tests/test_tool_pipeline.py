@@ -28,7 +28,7 @@ FAKE_DIGEST = {
     "hours": 168,
     "subjects": {
         "mathematics": {
-            "title": "A-Star Aspirants",
+            "title": "Math Study Group",
             "messages_read": 3,
             "data": {
                 "announcements": [],
@@ -44,7 +44,7 @@ FAKE_DIGEST = {
             },
         },
         "physics": {
-            "title": "A-Star Analysts",
+            "title": "Physics Study Group",
             "messages_read": 0,
             "data": {
                 "announcements": [],
@@ -56,7 +56,7 @@ FAKE_DIGEST = {
             },
         },
         "chemistry": {
-            "title": "A-Star Alchemists",
+            "title": "Chemistry Study Group",
             "messages_read": 2,
             "data": {
                 "announcements": [],

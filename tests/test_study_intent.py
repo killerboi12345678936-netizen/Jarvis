@@ -29,7 +29,7 @@ FAKE_DIGEST = {
     "hours": 168,
     "subjects": {
         "mathematics": {
-            "title": "A-Star Aspirants",
+            "title": "Math Study Group",
             "messages_read": 3,
             "data": {
                 "announcements": ["Test on Monday"],
@@ -45,7 +45,7 @@ FAKE_DIGEST = {
             },
         },
         "physics": {
-            "title": "A-Star Analysts",
+            "title": "Physics Study Group",
             "messages_read": 0,
             "data": {
                 "announcements": [],
@@ -57,7 +57,7 @@ FAKE_DIGEST = {
             },
         },
         "chemistry": {
-            "title": "A-Star Alchemists",
+            "title": "Chemistry Study Group",
             "messages_read": 2,
             "data": {
                 "announcements": ["Lab safety PDF shared"],
@@ -139,7 +139,7 @@ def test_format_digest_report_lists_subjects_and_readonly():
     text = format_digest_report(FAKE_DIGEST)
 
     assert "MATHEMATICS" in text
-    assert "A-Star Aspirants" in text
+    assert "Math Study Group" in text
     assert "PHYSICS" in text
     assert "No messages in this period" in text
     assert "CHEMISTRY" in text
