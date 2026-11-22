@@ -1,4 +1,4 @@
-import { API } from "./api";
+import { API, getDeviceToken } from "./api";
 
 export type VoiceState =
   | "idle"
@@ -90,6 +90,8 @@ export class LiveVoiceClient {
 
   private playbackSources: Set<AudioBufferSourceNode> = new Set();
 
+  private playbackEpoch = 0;
+
   private nextStartTime = 0;
 
   private handlers: VoiceClientHandlers = {};
@@ -109,7 +111,11 @@ export class LiveVoiceClient {
 
     this.handlers = handlers;
 
-    const wsUrl = API.replace(/^http/, "ws") + "/api/voice/ws";
+    const wsUrl =
+      API.replace(/^http/, "ws") +
+      "/api/voice/ws" +
+      `?token=${encodeURIComponent(getDeviceToken())}`;
+
     const ws = new WebSocket(wsUrl);
 
     ws.binaryType = "arraybuffer";
@@ -117,8 +123,20 @@ export class LiveVoiceClient {
 
     await new Promise<void>((resolve, reject) => {
       ws.onopen = () => resolve();
-      ws.onerror = () =>
-        reject(new Error("Could not reach the Jarvis voice service."));
+
+      ws.onerror = () => {
+        // The close event carries the real status; let it reject.
+      };
+
+      ws.onclose = (event) => {
+        reject(
+          event.code === 4401
+            ? new Error("Voice session rejected: unauthorized device.")
+            : new Error(
+                "Could not reach the Jarvis voice service.",
+              ),
+        );
+      };
     });
 
     try {
@@ -166,6 +184,11 @@ export class LiveVoiceClient {
     const context = new AudioContext({
       sampleRate: TARGET_SAMPLE_RATE,
     });
+
+    // Browsers may create the context suspended under autoplay
+    // policy; a suspended context receives scheduled audio but
+    // never plays it, which silences Jarvis completely.
+    void context.resume().catch(() => undefined);
 
     this.audioContext = context;
 
@@ -300,6 +323,8 @@ export class LiveVoiceClient {
       return;
     }
 
+    const epoch = this.playbackEpoch;
+
     const wav = new Blob(this.pendingAudio, { type: "audio/wav" });
 
     this.pendingAudio = [];
@@ -311,6 +336,21 @@ export class LiveVoiceClient {
     } catch {
       this.handlers.onError?.("Audio playback failed.");
       return;
+    }
+
+    if (epoch !== this.playbackEpoch) {
+      return;
+    }
+
+    if (context.state === "suspended") {
+      try {
+        await context.resume();
+      } catch {
+        this.handlers.onError?.(
+          "Audio is blocked until you interact with the page.",
+        );
+        return;
+      }
     }
 
     const source = context.createBufferSource();
@@ -334,6 +374,8 @@ export class LiveVoiceClient {
   }
 
   private stopPlayback(): void {
+    this.playbackEpoch += 1;
+
     for (const source of this.playbackSources) {
       try {
         source.stop();

@@ -216,19 +216,56 @@ async def _run_pipeline(websocket, send_json, session, pcm_bytes):
 
         await send_json({"type": "state", "state": "thinking"})
 
+        # The VAD only processes barge-in frames while it believes
+        # Jarvis is busy, so the server-side state must mirror the
+        # events sent to the client.
+        session.state = "thinking"
+
         full_response = ""
         pending_actions = []
         round_messages = list(messages)
         sentence_index = 0
         started_speaking = False
+        pending_text = ""
 
         rounds = max(1, settings.tool_max_rounds)
         interrupted = False
 
+        async def flush_pending_text():
+            nonlocal pending_text, sentence_index, started_speaking
+
+            leftover = pending_text.strip()
+
+            pending_text = ""
+
+            if not leftover:
+                return
+
+            if session.cancel_event.is_set():
+                return
+
+            if not started_speaking:
+                await send_json({
+                    "type": "state",
+                    "state": "speaking",
+                })
+
+                session.state = "speaking"
+                started_speaking = True
+
+            await _speak_sentence(
+                websocket,
+                send_json,
+                session,
+                leftover,
+                sentence_index,
+            )
+
+            sentence_index += 1
+
         for _ in range(rounds):
             stream_filter = ToolStreamFilter()
             round_text = ""
-            pending_text = ""
 
             async for chunk in provider_manager.stream(
                 messages=round_messages,
@@ -265,6 +302,7 @@ async def _run_pipeline(websocket, send_json, session, pcm_bytes):
                                 "type": "state",
                                 "state": "speaking",
                             })
+                            session.state = "speaking"
 
                         await _speak_sentence(
                             websocket,
@@ -284,7 +322,9 @@ async def _run_pipeline(websocket, send_json, session, pcm_bytes):
                 full_response += tail
                 pending_text += tail
 
-                sentences, _ = extract_complete_sentences(pending_text)
+                sentences, pending_text = (
+                    extract_complete_sentences(pending_text)
+                )
 
                 for sentence in sentences:
                     if session.cancel_event.is_set():
@@ -296,6 +336,7 @@ async def _run_pipeline(websocket, send_json, session, pcm_bytes):
                             "type": "state",
                             "state": "speaking",
                         })
+                        session.state = "speaking"
                         started_speaking = True
 
                     await _speak_sentence(
@@ -320,6 +361,8 @@ async def _run_pipeline(websocket, send_json, session, pcm_bytes):
             pending_actions.extend(actions)
 
             if pending_actions:
+                await flush_pending_text()
+
                 note = (
                     "I have proposed an action that needs your "
                     "approval in the actions panel."
@@ -327,6 +370,7 @@ async def _run_pipeline(websocket, send_json, session, pcm_bytes):
 
                 if not started_speaking:
                     await send_json({"type": "state", "state": "speaking"})
+                    session.state = "speaking"
                     started_speaking = True
 
                 await _speak_sentence(
@@ -355,6 +399,8 @@ async def _run_pipeline(websocket, send_json, session, pcm_bytes):
                     + "\nUse the results above to continue your answer."
                 ),
             })
+
+        await flush_pending_text()
 
         cleaned_response = full_response.strip()
 
@@ -415,10 +461,7 @@ async def _speak_sentence(websocket, send_json, session, sentence, index):
         "text": clean,
     })
 
-    audio_path = await run_in_threadpool(
-        synthesize_sentence,
-        clean[:1000],
-    )
+    audio_path = await synthesize_sentence(clean[:1000])
 
     audio_data = audio_path.read_bytes()
 

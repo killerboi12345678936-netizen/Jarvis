@@ -32,9 +32,31 @@ PIPER_MODEL = os.getenv(
 # PIPER EXECUTION
 # --------------------------------------------------
 
+def _find_piper_executable():
+
+    located = shutil.which(PIPER_EXECUTABLE)
+
+    if located:
+        return located
+
+    # uvicorn is often started with .venv\Scripts\python.exe without
+    # activating the venv, which leaves piper off the PATH.
+    candidates = (
+        PROJECT_ROOT / ".venv" / "Scripts" / f"{PIPER_EXECUTABLE}.exe",
+        PROJECT_ROOT / ".venv" / "Scripts" / PIPER_EXECUTABLE,
+        PROJECT_ROOT / ".venv" / "bin" / PIPER_EXECUTABLE,
+    )
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+
+    return None
+
+
 def _generate_audio(text: str) -> Path:
 
-    executable = shutil.which(PIPER_EXECUTABLE)
+    executable = _find_piper_executable()
 
     if not executable:
         raise RuntimeError(
@@ -50,7 +72,12 @@ def _generate_audio(text: str) -> Path:
 
     if not model_path.is_file():
         raise RuntimeError(
-            f"Piper model not found: {model_path}"
+            f"Piper voice model not found: {model_path}. It is not "
+            "bundled with the repository; download en_US-lessac-medium"
+            ".onnx and en_US-lessac-medium.onnx.json from "
+            "https://huggingface.co/rhasspy/piper-voices into "
+            "data/voice/ or point PIPER_MODEL in .env at your own "
+            "Piper .onnx voice."
         )
 
     output_path = VOICE_DIR / f"{uuid.uuid4().hex}.wav"

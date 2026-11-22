@@ -4,7 +4,6 @@ from pathlib import Path
 
 from backend.core.config import settings
 
-from backend.core.config import settings
 from faster_whisper import WhisperModel
 
 
@@ -32,6 +31,44 @@ def preload_model():
     get_model()
 
 
+def _decode_audio_file(path):
+    """Decode any supported media file to mono 16 kHz float32 using
+    PyAV directly. faster-whisper's own decode_audio cannot be used:
+    it passes metadata_errors= to av.open(), an argument removed in
+    PyAV 15+, and no older PyAV wheel exists for Python 3.14."""
+    import av
+    import numpy as np
+
+    with av.open(str(path)) as container:
+        audio_streams = [
+            stream for stream in container.streams
+            if stream.type == "audio"
+        ]
+
+        if not audio_streams:
+            raise ValueError("No audio stream found in the recording.")
+
+        resampler = av.AudioResampler(
+            format="s16",
+            layout="mono",
+            rate=16000,
+        )
+
+        chunks = []
+
+        for packet in container.demux(audio_streams[0]):
+            for frame in packet.decode():
+                for resampled in resampler.resample(frame):
+                    chunks.append(resampled.to_ndarray().reshape(-1))
+
+    if not chunks:
+        return np.zeros(0, dtype=np.float32)
+
+    return (
+        np.concatenate(chunks).astype(np.float32) / 32768.0
+    )
+
+
 def transcribe_audio(audio_bytes: bytes, suffix=".webm"):
     if not audio_bytes:
         raise ValueError("Audio recording is empty.")
@@ -56,8 +93,10 @@ def transcribe_audio(audio_bytes: bytes, suffix=".webm"):
 
         model = get_model()
 
+        samples = _decode_audio_file(temp_path)
+
         segments, info = model.transcribe(
-            temp_path,
+            samples,
             beam_size=3,
             vad_filter=True,
         )
