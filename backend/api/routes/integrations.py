@@ -86,30 +86,17 @@ async def telegram_plan_route(
     try:
         digest = await telegram_digest.build_digest(hours=hours)
 
-        deadlines_text = ""
+        tasks = telegram_digest.collect_tasks(digest)
 
-        for subject, subject_data in digest["subjects"].items():
-            data = subject_data.get("data")
-
-            if not data:
-                continue
-
-            for deadline in data.get("deadlines", []):
-                deadlines_text += (
-                    f"- [{subject}] {deadline.get('what', '')} - "
-                    f"due {deadline.get('when', 'unknown')}\n"
-                )
-
-            for assignment in data.get("assignments", []):
-                deadlines_text += (
-                    f"- [{subject}] assignment: "
-                    f"{assignment.get('title', '')} - "
-                    f"due {assignment.get('deadline') or 'unknown'}\n"
-                )
+        events = await calendar_service.get_upcoming(days=days)
 
         from backend.integrations.planning import build_study_plan
 
-        plan = await build_study_plan(deadlines_text=deadlines_text)
+        plan = await build_study_plan(
+            tasks=tasks,
+            events=events,
+            days=days,
+        )
 
         return {
             "kind": kind,

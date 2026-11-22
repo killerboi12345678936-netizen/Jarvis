@@ -4,11 +4,29 @@ import json
 import pytest
 
 from backend.integrations.telegram import digest as digest_module
+from backend.integrations.telegram.client import entity_ref
 from backend.integrations.telegram.digest import (
     _extract_json,
     _format_messages,
     build_digest,
+    normalize_digest_data,
 )
+
+
+def test_entity_ref_coerces_numeric_ids():
+    assert entity_ref("-1004484837901") == -1004484837901
+
+    assert entity_ref("-4998654096") == -4998654096
+
+
+def test_entity_ref_keeps_usernames_and_links():
+    assert entity_ref("@some_group") == "@some_group"
+
+    assert entity_ref("https://t.me/some_group") == (
+        "https://t.me/some_group"
+    )
+
+    assert entity_ref("") == ""
 
 
 def test_extract_json_variants():
@@ -169,3 +187,56 @@ def test_build_digest_falls_back_to_raw_on_bad_json(fake_fetch, monkeypatch):
 
     assert math["data"] is None
     assert "valid JSON" in math["raw_summary"]
+
+
+def test_normalize_keeps_canonical_shape():
+    data = {
+        "announcements": ["Test on Friday"],
+        "assignments": [{
+            "title": "Ex 4 and 5",
+            "details": "Due tomorrow",
+            "deadline": "2026-11-22",
+        }],
+        "deadlines": [{"what": "Test", "when": "Friday"}],
+        "recordings": ["Zoom link for lecture 12"],
+        "important": ["Bring calculator"],
+        "summary": "Busy week.",
+    }
+
+    normalized = normalize_digest_data(data)
+
+    assert normalized == data
+
+
+def test_normalize_repairs_drifted_model_output():
+    data = {
+        "announcements": ["Zoom link", None],
+        "assignments": ["Solve Ex 4", {"title": "Worksheet"}],
+        "deadlines": ["2026-11-20", {"what": "Quiz", "when": "Monday"}],
+        "important": "not a list",
+        "summary": "Short week.",
+    }
+
+    normalized = normalize_digest_data(data)
+
+    assert normalized["announcements"] == ["Zoom link"]
+    assert normalized["assignments"][0] == {
+        "title": "Solve Ex 4", "details": None, "deadline": None,
+    }
+    assert normalized["assignments"][1]["title"] == "Worksheet"
+    assert normalized["deadlines"][0] == {
+        "what": "2026-11-20", "when": None,
+    }
+    assert normalized["deadlines"][1] == {
+        "what": "Quiz", "when": "Monday",
+    }
+    assert normalized["important"] == ["not a list"]
+
+
+def test_normalize_survives_non_dict_output():
+    normalized = normalize_digest_data("total nonsense")
+
+    assert normalized["announcements"] == []
+    assert normalized["assignments"] == []
+    assert normalized["deadlines"] == []
+    assert normalized["summary"] == ""

@@ -157,11 +157,23 @@ async def build_calendar_study_plan(days=7, deadlines_text=""):
 
     schedule_text = describe_schedule(events, days=days)
 
+    tasks = [
+        {
+            "subject": "general",
+            "kind": "assignment",
+            "title": line.strip(),
+            "due": None,
+        }
+        for line in (deadlines_text or "").splitlines()
+        if line.strip()
+    ]
+
     from backend.integrations.planning import build_study_plan
 
     plan = await build_study_plan(
-        deadlines_text=deadlines_text,
-        schedule_text=schedule_text,
+        tasks=tasks,
+        events=events,
+        days=days,
     )
 
     return {

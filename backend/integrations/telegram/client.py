@@ -67,6 +67,15 @@ def configured_groups():
     }
 
 
+def entity_ref(group):
+    """Group values from .env arrive as strings, but Telethon only
+    resolves numeric IDs when passed as ints."""
+    try:
+        return int(group)
+    except (TypeError, ValueError):
+        return group
+
+
 def status():
     return {
         "credentials_present": bool(
@@ -101,7 +110,7 @@ async def fetch_recent_messages(hours=24, limit_per_group=200):
             continue
 
         try:
-            entity = await client.get_entity(group)
+            entity = await client.get_entity(entity_ref(group))
 
             messages = []
 

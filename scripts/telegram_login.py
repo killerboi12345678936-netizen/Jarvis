@@ -2,14 +2,16 @@
 """
 Interactive helper that generates a Telegram session string for Jarvis.
 
-This script ONLY logs your account in and prints a session string.
-It never reads or sends any group messages.
+This script ONLY logs your account in and saves the session string
+directly into the project .env file. It never reads or sends any
+group messages, and the session string is never displayed on screen.
 
 Steps:
 1. Create an app at https://my.telegram.org to get api_id and api_hash.
-2. Run this script from the project root with the venv activated:
+2. Add TELEGRAM_API_ID and TELEGRAM_API_HASH to .env (optional; the
+   script will ask for them if missing).
+3. Run this script from the project root with the venv activated:
        python scripts/telegram_login.py
-3. Paste the printed session string into .env as TELEGRAM_SESSION=...
 """
 
 import asyncio
@@ -24,7 +26,35 @@ from telethon.sessions import StringSession
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
+ENV_PATH = os.path.join(PROJECT_ROOT, ".env")
+
+load_dotenv(ENV_PATH)
+
+
+def save_session_to_env(session_string):
+    """Write TELEGRAM_SESSION into .env without printing it anywhere."""
+
+    lines = []
+
+    if os.path.exists(ENV_PATH):
+        with open(ENV_PATH, "r", encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+
+    replaced = False
+    updated = []
+
+    for line in lines:
+        if line.strip().startswith("TELEGRAM_SESSION="):
+            updated.append(f"TELEGRAM_SESSION={session_string}")
+            replaced = True
+        else:
+            updated.append(line)
+
+    if not replaced:
+        updated.append(f"TELEGRAM_SESSION={session_string}")
+
+    with open(ENV_PATH, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(updated) + "\n")
 
 
 async def main():
@@ -58,12 +88,14 @@ async def main():
 
         session_string = client.session.save()
 
+    save_session_to_env(session_string)
+
     print()
-    print("Add this line to your .env file:")
-    print()
-    print(f"TELEGRAM_SESSION={session_string}")
-    print()
-    print("Keep it private: it grants full read access to your account.")
+    print(
+        f"TELEGRAM_SESSION saved to .env "
+        f"({len(session_string)} characters, not displayed)."
+    )
+    print("Keep .env private: the session grants read access to your account.")
     print("Jarvis never sends messages; it only reads configured groups.")
 
 
